@@ -1,4 +1,35 @@
-﻿from __future__ import annotations
+"""
+Telegram Movie Recommendation Bot — MVP (Single File Edition)
+================================================================
+
+A compact, production-usable Telegram bot that lets users discover movies
+via TMDb: random picks, search, top rated, trending, details, and a
+simple SQLite-backed favorites list.
+
+--------------------------------------------------------------
+SETUP
+--------------------------------------------------------------
+1) Install dependencies:
+     pip install python-telegram-bot==21.* python-dotenv requests
+
+2) Create a ".env" file next to this script with:
+     BOT_TOKEN=your_telegram_bot_token
+     TMDB_API_KEY=your_tmdb_api_key
+     ADMIN_ID=123456789          # optional, your numeric Telegram ID
+
+3) Run:
+     python movie_bot.py
+
+--------------------------------------------------------------
+WHY A SINGLE FILE?
+--------------------------------------------------------------
+This is intentionally an MVP: fewer moving parts, easy to read top to
+bottom, easy to deploy. Sections below are clearly separated by comment
+banners so it can be split into modules later (config.py, database.py,
+tmdb.py, keyboards.py, handlers.py) without redesigning anything.
+"""
+
+from __future__ import annotations
 
 import logging
 import os
@@ -246,7 +277,9 @@ class TMDbClient:
     def _get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         params = dict(params or {})
         params["api_key"] = self._api_key
-        params.setdefault("language", "en-US")
+        # Persian by default so overviews/genre names come back translated;
+        # callers can override with language="en-US" for the fallback path.
+        params.setdefault("language", "fa-IR")
         params.setdefault("include_adult", "false")
 
         last_error: Optional[Exception] = None
@@ -261,6 +294,18 @@ class TMDbClient:
                 last_error = exc
                 log.warning("TMDb request failed (attempt %s): %s", attempt, exc)
         raise TMDbError(f"TMDb request to {path} failed after retries") from last_error
+
+    def _with_overview_fallback(self, path: str, details: dict[str, Any]) -> dict[str, Any]:
+        # Not every title has a Persian translation on TMDb yet; if the
+        # Persian overview came back empty, fetch the English one instead
+        # of showing nothing.
+        if not details.get("overview"):
+            try:
+                en_details = self._get(path, params={"language": "en-US"})
+                details["overview"] = en_details.get("overview") or details.get("overview", "")
+            except TMDbError:
+                pass
+        return details
 
     def get_trending(self) -> list[dict[str, Any]]:
         data = self._get("/trending/movie/week")
@@ -282,34 +327,90 @@ class TMDbClient:
         return data.get("results", [])
 
     def get_movie_details(self, movie_id: int) -> dict[str, Any]:
-        return self._get(f"/movie/{movie_id}")
+        details = self._get(f"/movie/{movie_id}")
+        return self._with_overview_fallback(f"/movie/{movie_id}", details)
+
+    def get_tv_trending(self) -> list[dict[str, Any]]:
+        data = self._get("/trending/tv/week")
+        return data.get("results", [])
+
+    def get_random_tv(self) -> Optional[dict[str, Any]]:
+        page = random.randint(1, 20)
+        data = self._get("/tv/popular", params={"page": page})
+        results = data.get("results", [])
+        return random.choice(results) if results else None
+
+    def get_tv_details(self, tv_id: int) -> dict[str, Any]:
+        details = self._get(f"/tv/{tv_id}")
+        return self._with_overview_fallback(f"/tv/{tv_id}", details)
+
+    def get_random_anime(self) -> Optional[dict[str, Any]]:
+        # TMDb has no dedicated "anime" flag, so this approximates it with
+        # the Animation genre (16) restricted to Japanese origin/language —
+        # the same heuristic most non-official anime trackers use.
+        page = random.randint(1, 10)
+        data = self._get(
+            "/discover/movie",
+            params={
+                "with_genres": "16",
+                "with_origin_country": "JP",
+                "sort_by": "popularity.desc",
+                "page": page,
+            },
+        )
+        results = data.get("results", [])
+        return random.choice(results) if results else None
 
 
 # =========================================================================
 # 5. FORMATTING HELPERS
 # =========================================================================
 
-def format_movie_caption(movie: dict[str, Any]) -> str:
-    """Builds the HTML-formatted caption shown with a movie's poster."""
-    title = movie.get("title") or movie.get("original_title") or "Unknown title"
-    year = (movie.get("release_date") or "----")[:4]
-    rating = movie.get("vote_average", 0)
-    overview = movie.get("overview") or "No description available."
+def format_movie_caption(item: dict[str, Any], media_type: str = "movie") -> str:
+    """Builds the HTML-formatted caption shown with a poster.
+
+    Handles movies, TV shows, and anime (which is just a TV/movie result
+    with a different icon) — the underlying TMDb fields differ slightly
+    between movies ("title"/"release_date") and TV ("name"/"first_air_date").
+    """
+    if media_type == "tv":
+        title = item.get("name") or item.get("original_name") or "بدون عنوان"
+        date_value = item.get("first_air_date") or "----"
+        icon = "📺"
+    elif media_type == "anime":
+        title = item.get("title") or item.get("original_title") or "بدون عنوان"
+        date_value = item.get("release_date") or "----"
+        icon = "🎌"
+    else:
+        title = item.get("title") or item.get("original_title") or "بدون عنوان"
+        date_value = item.get("release_date") or "----"
+        icon = "🎬"
+
+    year = date_value[:4]
+    rating = item.get("vote_average", 0)
+    overview = item.get("overview") or "توضیحاتی برای این عنوان موجود نیست."
     if len(overview) > 500:
         overview = overview[:497] + "..."
 
-    genres = movie.get("genres")
+    genres = item.get("genres")
     genre_line = ""
     if genres:
         names = ", ".join(g["name"] for g in genres)
-        genre_line = f"🎭 <b>Genres:</b> {names}\n"
+        genre_line = f"🎭 <b>ژانر:</b> {names}\n"
 
-    runtime = movie.get("runtime")
-    runtime_line = f"⏱ <b>Runtime:</b> {runtime} min\n" if runtime else ""
+    runtime_line = ""
+    if media_type == "tv":
+        episode_runtimes = item.get("episode_run_time") or []
+        if episode_runtimes:
+            runtime_line = f"⏱ <b>مدت هر قسمت:</b> {episode_runtimes[0]} دقیقه\n"
+    else:
+        runtime = item.get("runtime")
+        if runtime:
+            runtime_line = f"⏱ <b>مدت زمان:</b> {runtime} دقیقه\n"
 
     return (
-        f"🎬 <b>{title}</b> ({year})\n"
-        f"⭐ <b>Rating:</b> {rating:.1f}/10\n"
+        f"{icon} <b>{title}</b> ({year})\n"
+        f"⭐ <b>امتیاز:</b> {rating:.1f}/10\n"
         f"{genre_line}"
         f"{runtime_line}\n"
         f"{overview}"
@@ -330,8 +431,19 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎲 Random Movie", callback_data="menu:random")],
         [InlineKeyboardButton("🔥 Trending", callback_data="menu:trending")],
         [InlineKeyboardButton("⭐ Top Rated", callback_data="menu:top_rated")],
+        [InlineKeyboardButton("📺 سریال محبوب", callback_data="menu:tv")],
+        [InlineKeyboardButton("🎌 انیمه", callback_data="menu:anime")],
         [InlineKeyboardButton("❤️ Favorites", callback_data="menu:favorites")],
         [InlineKeyboardButton("❓ Help", callback_data="menu:help")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def simple_actions_keyboard(refresh_action: str, refresh_label: str) -> InlineKeyboardMarkup:
+    """Lighter keyboard for TV/anime cards, which aren't stored in favorites."""
+    buttons = [
+        [InlineKeyboardButton(refresh_label, callback_data=f"menu:{refresh_action}")],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -457,6 +569,47 @@ async def _send_movie(
         )
 
 
+async def _send_tv_or_anime(
+    update_or_query,
+    context: ContextTypes.DEFAULT_TYPE,
+    item: dict[str, Any],
+    media_type: str,
+    refresh_action: str,
+    refresh_label: str,
+) -> None:
+    """Shared logic to render a TV/anime card (not tracked in favorites)."""
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        details = tmdb.get_tv_details(item["id"]) if media_type == "tv" else item
+    except TMDbError as exc:
+        log.error("Failed to fetch TV details for id=%s: %s", item.get("id"), exc)
+        details = item
+
+    caption = format_movie_caption(details, media_type=media_type)
+    keyboard = simple_actions_keyboard(refresh_action, refresh_label)
+    image = poster_url(details)
+
+    chat = update_or_query.effective_chat if hasattr(update_or_query, "effective_chat") else None
+    target_chat_id = chat.id if chat else update_or_query.message.chat_id
+
+    if image:
+        await context.bot.send_photo(
+            chat_id=target_chat_id,
+            photo=image,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -482,6 +635,24 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await query.message.reply_text("😕 Couldn't find a movie right now, try again.")
                 return
             await _send_movie(query, context, movie, telegram_id)
+
+        elif action == "tv":
+            show = tmdb.get_random_tv()
+            if show is None:
+                await query.message.reply_text("😕 سریالی پیدا نشد، دوباره امتحان کن.")
+                return
+            await _send_tv_or_anime(
+                query, context, show, "tv", refresh_action="tv", refresh_label="🔄 سریال دیگر"
+            )
+
+        elif action == "anime":
+            anime = tmdb.get_random_anime()
+            if anime is None:
+                await query.message.reply_text("😕 انیمه‌ای پیدا نشد، دوباره امتحان کن.")
+                return
+            await _send_tv_or_anime(
+                query, context, anime, "anime", refresh_action="anime", refresh_label="🔄 انیمه دیگر"
+            )
 
         elif action == "trending":
             movies = tmdb.get_trending()[:8]
@@ -638,4 +809,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
