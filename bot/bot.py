@@ -85,12 +85,14 @@ class Config:
     bot_token: str
     tmdb_api_key: str
     admin_id: Optional[int]
+    gemini_api_key: Optional[str]
 
     @staticmethod
     def load() -> "Config":
         bot_token = os.getenv("BOT_TOKEN", "").strip()
         tmdb_api_key = os.getenv("TMDB_API_KEY", "").strip()
         admin_id_raw = os.getenv("ADMIN_ID", "").strip()
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
 
         missing = []
         if not bot_token:
@@ -110,7 +112,12 @@ class Config:
             except ValueError:
                 raise RuntimeError("ADMIN_ID must be a numeric Telegram user ID.")
 
-        return Config(bot_token=bot_token, tmdb_api_key=tmdb_api_key, admin_id=admin_id)
+        return Config(
+            bot_token=bot_token,
+            tmdb_api_key=tmdb_api_key,
+            admin_id=admin_id,
+            gemini_api_key=gemini_api_key,
+        )
 
 
 # =========================================================================
@@ -363,6 +370,58 @@ class TMDbClient:
 
 
 # =========================================================================
+# 4b. GEMINI CLIENT (free-text smart recommendations)
+# -------------------------------------------------------------------------
+# Why: turns a fuzzy request ("something like Interstellar", "a light
+# comedy for tonight") into one concrete movie title we can then look up
+# on TMDb — this is the "AI Ready" hook from the original spec.
+# =========================================================================
+
+GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
+class GeminiError(Exception):
+    """Raised when the Gemini API cannot fulfill a request."""
+
+
+class GeminiClient:
+    """Thin wrapper around the Gemini API for free-text movie recommendations."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._session = requests.Session()
+
+    def suggest_movie_title(self, user_request: str) -> str:
+        """Turns a free-text request into one concrete movie title to search for."""
+        prompt = (
+            "You are a movie recommendation assistant. Based on the user's "
+            "request below (which may be in Persian or English), suggest "
+            "exactly ONE specific real movie that best matches what they "
+            "want. Reply with ONLY the movie's official English title "
+            "(add the release year in parentheses if it helps disambiguate) "
+            "and nothing else — no explanation, no quotes, no extra text.\n\n"
+            f"User's request: {user_request}"
+        )
+        try:
+            response = self._session.post(
+                GEMINI_URL,
+                headers={
+                    "x-goog-api-key": self._api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return text.strip()
+        except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
+            raise GeminiError("Gemini request failed") from exc
+
+
+# =========================================================================
 # 5. FORMATTING HELPERS
 # =========================================================================
 
@@ -428,6 +487,7 @@ def poster_url(movie: dict[str, Any]) -> Optional[str]:
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
+        [InlineKeyboardButton("🧠 پیشنهاد هوشمند", callback_data="menu:ai")],
         [InlineKeyboardButton("🎲 Random Movie", callback_data="menu:random")],
         [InlineKeyboardButton("🔥 Trending", callback_data="menu:trending")],
         [InlineKeyboardButton("⭐ Top Rated", callback_data="menu:top_rated")],
@@ -624,6 +684,20 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
             )
 
+        elif action == "ai":
+            gemini = context.bot_data.get("gemini")
+            if gemini is None:
+                await query.message.reply_text(
+                    "⚠️ این قابلیت هنوز فعال نشده (کلید GEMINI_API_KEY تنظیم نشده).",
+                    reply_markup=back_to_menu_keyboard(),
+                )
+                return
+            context.user_data["awaiting_ai_recommendation"] = True
+            await query.message.reply_text(
+                "🧠 چه فیلمی دلت می‌خواد ببینی؟ توضیح بده — مثلاً «یه فیلم علمی-تخیلی "
+                "شبیه اینترستلار» یا «یه کمدی سبک برای شب جمعه»."
+            )
+
         elif action == "help":
             await query.message.reply_text(
                 HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard()
@@ -724,7 +798,8 @@ async def on_favorite_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treats any plain text message as a movie title search."""
+    """Treats any plain text message as a movie title search, unless the
+    user is mid-conversation answering the smart-recommendation prompt."""
     if update.message is None or not update.message.text:
         return
 
@@ -732,8 +807,41 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not query_text:
         return
 
-    tmdb: TMDbClient = context.bot_data["tmdb"]
     telegram_id = update.effective_user.id
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    if context.user_data.get("awaiting_ai_recommendation"):
+        context.user_data["awaiting_ai_recommendation"] = False
+        gemini: Optional[GeminiClient] = context.bot_data.get("gemini")
+
+        try:
+            suggested_title = gemini.suggest_movie_title(query_text)
+        except GeminiError as exc:
+            log.error("Gemini suggestion failed: %s", exc)
+            await update.message.reply_text(
+                "⚠️ پیشنهاد هوشمند موقتاً در دسترس نیست، بعداً دوباره امتحان کن."
+            )
+            return
+
+        try:
+            results = tmdb.search_movies(suggested_title)
+        except TMDbError as exc:
+            log.error("TMDb search failed for AI suggestion='%s': %s", suggested_title, exc)
+            await update.message.reply_text("⚠️ Search is temporarily unavailable. Please try again shortly.")
+            return
+
+        if not results:
+            await update.message.reply_text(
+                f"😕 برای پیشنهاد «{suggested_title}» چیزی روی TMDb پیدا نشد.",
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+
+        await update.message.reply_text(
+            f"🧠 <b>پیشنهاد هوشمند:</b> {suggested_title}", parse_mode=ParseMode.HTML
+        )
+        await _send_movie(update, context, results[0], telegram_id)
+        return
 
     try:
         results = tmdb.search_movies(query_text)
@@ -783,6 +891,9 @@ def build_application(config: Config) -> Application:
     application.bot_data["config"] = config
     application.bot_data["db"] = Database(DB_PATH)
     application.bot_data["tmdb"] = TMDbClient(config.tmdb_api_key)
+    application.bot_data["gemini"] = (
+        GeminiClient(config.gemini_api_key) if config.gemini_api_key else None
+    )
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
