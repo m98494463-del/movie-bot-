@@ -261,11 +261,9 @@ class TMDbClient:
             raise TMDbError("خطا در برقراری ارتباط با TMDb") from exc
 
     async def get_movie_details(self, movie_id: int) -> dict[str, Any]:
-        # Append credits and videos in a single request!
         params = {"append_to_response": "videos,credits", "language": "fa-IR"}
         details = await self._get(f"/movie/{movie_id}", params=params)
         
-        # Fallback to English if Persian overview is empty
         if not details.get("overview"):
             params["language"] = "en-US"
             en_details = await self._get(f"/movie/{movie_id}", params=params)
@@ -273,7 +271,7 @@ class TMDbClient:
             
         return details
 
-    async def get_trending((self) -> list[dict[str, Any]]:
+    async def get_trending(self) -> list[dict[str, Any]]:
         data = await self._get("/trending/movie/week")
         return data.get("results", [])
 
@@ -366,11 +364,9 @@ def format_movie_caption(details: dict[str, Any], media_type: str = "movie") -> 
     if len(overview) > 400:
         overview = overview[:397] + "..."
 
-    # Extract Genres
     genres = details.get("genres", [])
     genre_str = ", ".join([g["name"] for g in genres]) if genres else "نامشخص"
 
-    # Extract Director & Cast
     credits = details.get("credits", {})
     crew = credits.get("crew", [])
     cast = credits.get("cast", [])
@@ -501,7 +497,6 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send message to all users: /broadcast <message>"""
     config: Config = context.bot_data["config"]
     if not update.effective_user or update.effective_user.id != config.admin_id:
         return
@@ -521,7 +516,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(chat_id=uid, text=text_to_send)
             success += 1
-            await asyncio.sleep(0.05) # Prevent flood rate limits
+            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
 
@@ -635,7 +630,6 @@ async def on_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
         db.remove_favorite(query.from_user.id, movie_id)
         await query.answer("از علاقه‌مندی‌ها حذف شد 💔")
 
-    # Refresh keyboard
     trailer = get_youtube_trailer(await tmdb.get_movie_details(movie_id))
     new_kb = movie_actions_keyboard(movie_id, db.is_favorite(query.from_user.id, movie_id), trailer)
     await query.edit_message_reply_markup(reply_markup=new_kb)
@@ -685,7 +679,6 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
     tmdb: TMDbClient = context.bot_data["tmdb"]
 
-    # AI Prompt Handler
     if context.user_data.get("awaiting_ai"):
         context.user_data["awaiting_ai"] = False
         gemini: GeminiClient = context.bot_data.get("gemini")
@@ -704,7 +697,6 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await msg.edit_text("❌ خطایی در ارتباط با هوش مصنوعی رخ داد.")
         return
 
-    # Normal Search
     results = await tmdb.search_movies(text)
     if not results:
         await update.message.reply_text("😕 فیلمی با این عنوان یافت نشد. دوباره تلاش کنید.", reply_markup=back_to_menu_keyboard())
@@ -720,13 +712,11 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def build_application(config: Config) -> Application:
     app = Application.builder().token(config.bot_token).build()
 
-    # Context Data
     app.bot_data["config"] = config
     app.bot_data["db"] = Database(DB_PATH)
     app.bot_data["tmdb"] = TMDbClient(config.tmdb_api_key)
     app.bot_data["gemini"] = GeminiClient(config.gemini_api_key) if config.gemini_api_key else None
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_admin_stats))
