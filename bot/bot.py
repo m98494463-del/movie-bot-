@@ -1,10 +1,9 @@
-
-fixed_code = '''"""
+"""
 Telegram Movie & TV Recommendation Bot — ULTIMATE EDITION v2.0
 ================================================================
 Fixes & Improvements:
+- Fixed literal "\\n" string escaping bug in Telegram messages
 - Fixed all query.message None crashes (old callbacks, inline, etc.)
-- Fixed unterminated string issues and syntax robustness
 - Added TMDb in-memory cache (TTL) to reduce API calls
 - Added per-user rate limiting (anti-spam)
 - Added paginated search results (Previous/Next buttons)
@@ -12,8 +11,7 @@ Fixes & Improvements:
 - Added TV Show & Actor search support
 - Added Smart "More Like This" with inline browsing
 - Added proper client lifecycle (shutdown cleanup)
-- Added user activity logging
-- Enhanced Persian UI with better error messages
+- Enhanced Persian UI with clean formatting
 - Added /cancel command to exit any mode
 """
 
@@ -164,7 +162,6 @@ class RateLimiter:
     def is_allowed(self, user_id: int) -> bool:
         now = time.time()
         timestamps = self._users.get(user_id, [])
-        # Filter old timestamps
         timestamps = [t for t in timestamps if now - t < self.window]
         self._users[user_id] = timestamps
         if len(timestamps) >= self.max_requests:
@@ -459,17 +456,17 @@ class GeminiClient:
         prompt = (
             "You are a movie recommendation assistant. Based on the user request below (in Persian or English), "
             "suggest EXACTLY ONE single movie title that best fits. Output ONLY the official English title "
-            "and nothing else. DO NOT use markdown bold, quotes, or any punctuation.\\n\\n"
+            "and nothing else. DO NOT use markdown bold, quotes, or any punctuation.\n\n"
             f"User prompt: {user_request}"
         )
         raw_title = await self._generate_content(prompt)
-        cleaned_title = re.sub(r'[*"`\\\'\\n]', '', raw_title).strip()
+        cleaned_title = re.sub(r'[*"`\'\n]', '', raw_title).strip()
         return cleaned_title
 
     async def chat_about_movies(self, user_query: str) -> str:
         prompt = (
             "You are a friendly, expert cinema assistant. Answer the user's question about movies, actors, "
-            "directors, or plot explanations in Persian (Farsi). Keep the response helpful, engaging, and well-formatted.\\n\\n"
+            "directors, or plot explanations in Persian (Farsi). Keep the response helpful, engaging, and well-formatted.\n\n"
             f"User Question: {user_query}"
         )
         return await self._generate_content(prompt)
@@ -502,17 +499,17 @@ def format_movie_caption(details: dict[str, Any], media_type: str = "movie") -> 
     type_label = "📺 سریال" if media_type == "tv" else ("🎌 انیمه" if media_type == "anime" else "🎬 فیلم")
 
     caption = (
-        f"{type_label} <b>{title}</b> ({year})\\n"
-        f"⭐ <b>امتیاز:</b> {rating:.1f}/10\\n"
-        f"🎭 <b>ژانر:</b> {genre_str}\\n"
+        f"{type_label} <b>{title}</b> ({year})\n"
+        f"⭐ <b>امتیاز:</b> {rating:.1f}/10\n"
+        f"🎭 <b>ژانر:</b> {genre_str}\n"
     )
 
     if director:
-        caption += f"🎬 <b>کارگردان:</b> {director}\\n"
+        caption += f"🎬 <b>کارگردان:</b> {director}\n"
     if top_cast:
-        caption += f"👥 <b>بازیگران:</b> {top_cast}\\n"
+        caption += f"👥 <b>بازیگران:</b> {top_cast}\n"
 
-    caption += f"\\n📝 <b>خلاصه داستان:</b>\\n{overview}"
+    caption += f"\n📝 <b>خلاصه داستان:</b>\n{overview}"
     return caption
 
 
@@ -528,10 +525,10 @@ def format_person_caption(person: dict[str, Any]) -> str:
     known_for = ", ".join([m.get("title", "نامشخص") for m in cast[:5]]) if cast else "نامشخص"
     
     return (
-        f"🎭 <b>{name}</b>\\n"
-        f"📌 <b>حرفه:</b> {dept}\\n"
-        f"🎬 <b>شناخته‌شده برای:</b> {known_for}\\n\\n"
-        f"📝 <b>بیوگرافی:</b>\\n{bio}"
+        f"🎭 <b>{name}</b>\n"
+        f"📌 <b>حرفه:</b> {dept}\n"
+        f"🎬 <b>شناخته‌شده برای:</b> {known_for}\n\n"
+        f"📝 <b>بیوگرافی:</b>\n{bio}"
     )
 
 
@@ -680,8 +677,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db.upsert_user(user.id, user.username, user.first_name)
 
     welcome_text = (
-        f"سلام {user.first_name if user else ''} عزیز! 👋\\n\\n"
-        "🎬 به **ربات حرفه‌ای پیشنهاد فیلم و سریال** خوش آمدید.\\n"
+        f"سلام {user.first_name if user else ''} عزیز! 👋\n\n"
+        "🎬 به **ربات حرفه‌ای پیشنهاد فیلم و سریال** خوش آمدید.\n"
         "با دکمه‌های زیر جستجو کنید یا اسم فیلم/بازیگر رو برام چت کنید!"
     )
     await update.message.reply_text(
@@ -691,13 +688,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "❓ **راهنمای جامع ربات:**\\n\\n"
-        "🔍 **جستجو:** نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\\n"
-        "🧠 **پیشنهاد هوشمند:** حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\\n"
-        "💬 **چت با دستیار:** درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\\n"
-        "📺 **سریال:** از منو سریال محبوب رو امتحان کن یا اسم سریال بفرست.\\n"
-        "🎭 **بازیگر:** اسم بازیگر رو بفرست تا فیلم‌هاشو نشون بدم.\\n"
-        "🔎 **اینلاین مود:** تایپ کن `@BotUsername Inception` درون هر چت برای اشتراک سریع!\\n\\n"
+        "❓ **راهنمای جامع ربات:**\n\n"
+        "🔍 **جستجو:** نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\n"
+        "🧠 **پیشنهاد هوشمند:** حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\n"
+        "💬 **چت با دستیار:** درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\n"
+        "📺 **سریال:** از منو سریال محبوب رو امتحان کن یا اسم سریال بفرست.\n"
+        "🎭 **بازیگر:** اسم بازیگر رو بفرست تا فیلم‌هاشو نشون بدم.\n"
+        "🔎 **اینلاین مود:** تایپ کن `@BotUsername Inception` درون هر چت برای اشتراک سریع!\n\n"
         "❌ برای خروج از هر حالتی /cancel رو بزن."
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
@@ -715,7 +712,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.effective_user or update.effective_user.id != config.admin_id:
         return
     db: Database = context.bot_data["db"]
-    await update.message.reply_text(f"📊 **آمار ربات:**\\n👥 تعداد کاربران: `{db.user_count()}`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📊 **آمار ربات:**\n👥 تعداد کاربران: `{db.user_count()}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -725,7 +722,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     text_to_send = " ".join(context.args)
     if not text_to_send:
-        await update.message.reply_text("❌ متن پیام را وارد کنید:\\n`/broadcast سلام!`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("❌ متن پیام را وارد کنید:\n`/broadcast سلام!`", parse_mode=ParseMode.MARKDOWN)
         return
 
     db: Database = context.bot_data["db"]
@@ -745,7 +742,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             failed += 1
 
-    await msg.edit_text(f"✅ **پایان ارسال.**\\nموفق: {success}\\nناموفق: {failed}")
+    await msg.edit_text(f"✅ **پایان ارسال.**\nموفق: {success}\nناموفق: {failed}")
 
 
 # --- MOVIE RENDERING HELPER ---
@@ -854,7 +851,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await safe_edit_text(query, "⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
             return
         context.user_data["mode"] = "ai_recommendation"
-        text = "🧠 **چه فیلمی تو چه سبکی دوست داری ببینی؟**\\nمثلاً: «یه فیلم معمایی پیچیده مثل Shutter Island»"
+        text = "🧠 **چه فیلمی تو چه سبکی دوست داری ببینی؟**\nمثلاً: «یه فیلم معمایی پیچیده مثل Shutter Island»"
         if query.message:
             try:
                 await query.message.edit_text(text, reply_markup=cancel_keyboard())
@@ -868,7 +865,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await safe_edit_text(query, "⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
             return
         context.user_data["mode"] = "ai_chat"
-        text = "💬 **دستیار سینمایی در خدمت شماست!**\\nهر سوالی درباره فیلم، بازیگران، داستان یا نقد داری بپرس:"
+        text = "💬 **دستیار سینمایی در خدمت شماست!**\nهر سوالی درباره فیلم، بازیگران، داستان یا نقد داری بپرس:"
         if query.message:
             try:
                 await query.message.edit_text(text, reply_markup=cancel_keyboard())
@@ -897,7 +894,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "trending":
         movies = await tmdb.get_trending()
         lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in movies[:10]]
-        text = "🔥 **فیلم‌های ترند هفته:**\\n\\n" + "\\n".join(lines)
+        text = "🔥 **فیلم‌های ترند هفته:**\n\n" + "\n".join(lines)
         if query.message:
             try:
                 await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
@@ -909,7 +906,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "top_rated":
         movies = await tmdb.get_top_rated()
         lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in movies[:10]]
-        text = "⭐ **برترین فیلم‌های تاریخ:**\\n\\n" + "\\n".join(lines)
+        text = "⭐ **برترین فیلم‌های تاریخ:**\n\n" + "\n".join(lines)
         if query.message:
             try:
                 await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
@@ -983,7 +980,7 @@ async def on_similar_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_reply_text(query, "😕 فیلم مشابهی پیدا نشد.", reply_markup=back_to_menu_keyboard())
         return
 
-    text = "🎭 **فیلم‌های مشابه پیشنهاد شده:**\\n\\nروی هر کدام کلیک کنید تا جزئیاتش رو ببینید."
+    text = "🎭 **فیلم‌های مشابه پیشنهاد شده:**\n\nروی هر کدام کلیک کنید تا جزئیاتش رو ببینید."
     keyboard = similar_movies_keyboard(sim_movies, movie_id, media_type)
     
     if query.message:
@@ -1107,7 +1104,7 @@ async def on_person_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in cast[:10]]
-    text = f"🎬 **فیلم‌های {person.get('name', 'بازیگر')}:**\\n\\n" + "\\n".join(lines) + "\\n\\nبرای دیدن جزئیات هر کدام، نام آن را بفرستید."
+    text = f"🎬 **فیلم‌های {person.get('name', 'بازیگر')}:**\n\n" + "\n".join(lines) + "\n\nبرای دیدن جزئیات هر کدام، نام آن را بفرستید."
     await safe_edit_text(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
 
 
@@ -1126,7 +1123,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     items = []
     for m in results[:5]:
-        caption = f"🎬 <b>{m.get('title')}</b>\\n⭐ امتیاز: {m.get('vote_average', 0)}/10\\n\\n{m.get('overview', '')}"
+        caption = f"🎬 <b>{m.get('title')}</b>\n⭐ امتیاز: {m.get('vote_average', 0)}/10\n\n{m.get('overview', '')}"
         if len(caption) > 4096:
             caption = caption[:4093] + "..."
         thumb = poster_url(m)
@@ -1189,7 +1186,6 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         msg = await update.message.reply_text("💭 در حال نوشتن پاسخ...")
         try:
             response = await gemini.chat_about_movies(text)
-            # Truncate if too long for Telegram
             if len(response) > 4096:
                 response = response[:4093] + "..."
             await msg.edit_text(response, reply_markup=cancel_keyboard())
@@ -1310,12 +1306,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-'''
-
-# Save to output
-output_path = '/mnt/agents/output/movie_bot_fixed.py'
-with open(output_path, 'w', encoding='utf-8') as f:
-    f.write(fixed_code)
-
-print(f"✅ Fixed code saved to {output_path}")
-print(f"📊 Size: {len(fixed_code)} chars, {len(fixed_code.splitlines())} lines")
