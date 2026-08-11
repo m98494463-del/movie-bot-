@@ -1,15 +1,12 @@
 """
-Telegram Movie Recommendation & Discovery Bot — Pro Edition
+Telegram Movie Recommendation Bot — PRO MAX Edition
 ================================================================
-
-Features:
-- Async TMDb & Gemini API Integration (httpx)
-- Smart AI Movie Recommendations
-- Interactive Genre Browsing
-- YouTube Trailers & Cast/Crew Details
-- Favorites Management with Interactive Pagination
-- Inline Search Mode (Search anywhere in Telegram)
-- Admin Panel with Mass Broadcast & User Stats
+Updates:
+- Fixed Gemini API authentication & auto-fallback (2.0-flash, 1.5-flash)
+- Clean output parser for TMDb strict search
+- Added Direct AI Cinematic Chat Assistant
+- Added "Similar Movies" recommendations
+- Enhanced Persian UI & Keyboards
 """
 
 from __future__ import annotations
@@ -18,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -81,7 +79,7 @@ class Config:
         if not tmdb_api_key:
             missing.append("TMDB_API_KEY")
         if missing:
-            raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
         admin_id = int(admin_id_raw) if admin_id_raw.isdigit() else None
 
@@ -116,7 +114,7 @@ log = setup_logging()
 
 
 # =========================================================================
-# 3. DATABASE (Repository Pattern)
+# 3. DATABASE
 # =========================================================================
 
 class Database:
@@ -237,7 +235,6 @@ GENRES_MAP = {
 class TMDbError(Exception):
     pass
 
-
 class TMDbClient:
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
@@ -270,6 +267,10 @@ class TMDbClient:
             details["overview"] = en_details.get("overview", "توضیحاتی موجود نیست.")
             
         return details
+
+    async def get_similar_movies(self, movie_id: int) -> list[dict[str, Any]]:
+        data = await self._get(f"/movie/{movie_id}/similar")
+        return data.get("results", [])
 
     async def get_trending(self) -> list[dict[str, Any]]:
         data = await self._get("/trending/movie/week")
@@ -312,11 +313,8 @@ class TMDbClient:
 
 
 # =========================================================================
-# 5. ASYNC GEMINI CLIENT
+# 5. ROBUST ASYNC GEMINI CLIENT (FIXED)
 # =========================================================================
-
-GEMINI_MODEL = "gemini-1.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 class GeminiError(Exception):
     pass
@@ -324,30 +322,55 @@ class GeminiError(Exception):
 class GeminiClient:
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
-        self._client = httpx.AsyncClient(timeout=12.0)
+        self._client = httpx.AsyncClient(timeout=15.0)
 
     async def close(self):
         await self._client.aclose()
 
+    async def _generate_content(self, prompt: str) -> str:
+        # Fallback list of models
+        models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        
+        last_error = None
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self._api_key}"
+            try:
+                resp = await self._client.post(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return text.strip()
+                else:
+                    log.warning("Gemini model %s returned status %s: %s", model, resp.status_code, resp.text)
+            except Exception as exc:
+                last_error = exc
+                log.warning("Gemini model %s failed: %s", model, exc)
+
+        raise GeminiError(f"تمام مدل‌های هوش مصنوعی با خطا مواجه شدند: {last_error}")
+
     async def suggest_movie_title(self, user_request: str) -> str:
         prompt = (
-            "You are a movie recommendation assistant. Based on the user prompt below, "
-            "suggest ONE single best movie title. Output ONLY the official English movie title "
-            "and nothing else (no extra text, quotes, or release years unless essential).\n\n"
-            f"User request: {user_request}"
+            "You are a movie recommendation assistant. Based on the user request below (in Persian or English), "
+            "suggest EXACTLY ONE single movie title that best fits. Output ONLY the official English title "
+            "and nothing else. DO NOT use markdown bold, quotes, or any punctuation.\n\n"
+            f"User prompt: {user_request}"
         )
-        try:
-            resp = await self._client.post(
-                GEMINI_URL,
-                headers={"x-goog-api-key": self._api_key, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as exc:
-            log.error("Gemini request failed: %s", exc)
-            raise GeminiError("خطا در پردازش هوش مصنوعی") from exc
+        raw_title = await self._generate_content(prompt)
+        # Clean markdown / extra characters from AI response
+        cleaned_title = re.sub(r'[*"`\'\n]', '', raw_title).strip()
+        return cleaned_title
+
+    async def chat_about_movies(self, user_query: str) -> str:
+        prompt = (
+            "You are a friendly, expert cinema assistant. Answer the user's question about movies, actors, "
+            "directors, or plot explanations in Persian (Farsi). Keep the response helpful, engaging, and well-formatted.\n\n"
+            f"User Question: {user_query}"
+        )
+        return await self._generate_content(prompt)
 
 
 # =========================================================================
@@ -410,7 +433,7 @@ def poster_url(item: dict[str, Any]) -> Optional[str]:
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 پیشنهاد هوشمند (AI)", callback_data="menu:ai")],
+        [InlineKeyboardButton("🧠 پیشنهاد هوشمند (AI)", callback_data="menu:ai"), InlineKeyboardButton("💬 چت با دستیار AI", callback_data="menu:aichat")],
         [InlineKeyboardButton("🎲 فیلم تصادفی", callback_data="menu:random"), InlineKeyboardButton("📂 فیلتر ژانر", callback_data="menu:genres")],
         [InlineKeyboardButton("🔥 داغ‌ترین‌ها", callback_data="menu:trending"), InlineKeyboardButton("⭐ برترین‌ها", callback_data="menu:top_rated")],
         [InlineKeyboardButton("📺 سریال محبوب", callback_data="menu:tv"), InlineKeyboardButton("🎌 انیمه", callback_data="menu:anime")],
@@ -434,8 +457,11 @@ def genre_menu_keyboard() -> InlineKeyboardMarkup:
 def movie_actions_keyboard(movie_id: int, is_favorite: bool, trailer_url: Optional[str] = None) -> InlineKeyboardMarkup:
     buttons = []
     
+    row1 = []
     if trailer_url:
-        buttons.append([InlineKeyboardButton("🎬 تماشای تریلر (یوتیوب)", url=trailer_url)])
+        row1.append(InlineKeyboardButton("🎬 تماشای تریلر", url=trailer_url))
+    row1.append(InlineKeyboardButton("🎭 فیلم‌های مشابه", callback_data=f"similar:{movie_id}"))
+    buttons.append(row1)
 
     fav_btn = (
         InlineKeyboardButton("💔 حذف از علاقه‌مندی‌ها", callback_data=f"unfav:{movie_id}")
@@ -467,8 +493,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     welcome_text = (
         f"سلام {user.first_name if user else ''} عزیز! 👋\n\n"
-        "🎬 به **ربات پیشنهاد فیلم و سریال** خوش آمدید.\n"
-        "با استفاده از دکمه‌های زیر فیلم پیدا کنید یا اسم فیلم مورد نظرتون رو مستقیم برام بفرستید!"
+        "🎬 به **ربات حرفه‌ای پیشنهاد فیلم و سریال** خوش آمدید.\n"
+        "با دکمه‌های زیر جستجو کنید یا اسم فیلم/بازیگر رو برام چت کنید!"
     )
     await update.message.reply_text(
         welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard()
@@ -477,11 +503,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "❓ **راهنمای ربات:**\n\n"
-        "🔍 **جستجو:** کافیه اسم فیلم رو (فارسی یا انگلیسی) چت کنی.\n"
-        "🧠 **پیشنهاد هوشمند:** حس و حالت رو بگو تا هوش مصنوعی بهت فیلم معرفی کنه.\n"
-        "📂 **ژانرها:** فیلم براساس سبک مورد علاقه‌ت پیدا کن.\n"
-        "🔎 **جستجوی سریع در چت‌ها:** تایپ کن `@BotUsername Inception` تا سریع فیلم بفرستی."
+        "❓ **راهنمای جامع ربات:**\n\n"
+        "🔍 **جستجو:** نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\n"
+        "🧠 **پیشنهاد هوشمند:** حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\n"
+        "💬 **چت با دستیار:** درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\n"
+        "🔎 **اینلاین مود:** تایپ کن `@BotUsername Inception` درون هر چت برای اشتراک سریع!"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
 
@@ -503,7 +529,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     text_to_send = " ".join(context.args)
     if not text_to_send:
-        await update.message.reply_text("❌ لطفاً متن پیام را وارد کنید. مثال:\n`/broadcast سلام به همه!`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("❌ متن پیام را وارد کنید:\n`/broadcast سلام!`", parse_mode=ParseMode.MARKDOWN)
         return
 
     db: Database = context.bot_data["db"]
@@ -516,11 +542,11 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(chat_id=uid, text=text_to_send)
             success += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
         except Exception:
             failed += 1
 
-    await msg.edit_text(f"✅ **ارسال به پایان رسید.**\nموفق: {success}\nناموفق: {failed}")
+    await msg.edit_text(f"✅ **پایان ارسال.**\nموفق: {success}\nناموفق: {failed}")
 
 
 # --- MOVIE RENDERING HELPER ---
@@ -561,14 +587,22 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db: Database = context.bot_data["db"]
 
     if action == "home":
+        context.user_data.clear()
         await query.message.reply_text("🏠 منوی اصلی:", reply_markup=main_menu_keyboard())
 
     elif action == "ai":
         if not context.bot_data.get("gemini"):
-            await query.message.reply_text("⚠️ هوش مصنوعی در حال حاضر غیرفعال است (کلید GEMINI تنظیم نشده).", reply_markup=back_to_menu_keyboard())
+            await query.message.reply_text("⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
             return
-        context.user_data["awaiting_ai"] = True
-        await query.message.reply_text("🧠 **چه فیلمی دلت می‌خواد؟**\nمثلاً بگو: «یه فیلم ترسناک توی غار» یا «یه کمدی هیجان انگیز شبیه Mask»")
+        context.user_data["mode"] = "ai_recommendation"
+        await query.message.reply_text("🧠 **چه فیلمی تو چه سبکی دوست داری ببینی؟**\nمثلاً: «یه فیلم معپایی پیچیده مثل Shutter Island»")
+
+    elif action == "aichat":
+        if not context.bot_data.get("gemini"):
+            await query.message.reply_text("⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
+            return
+        context.user_data["mode"] = "ai_chat"
+        await query.message.reply_text("💬 **دستیار سینمایی در خدمت شماست!**\nهر سوالی درباره فیلم، بازیگران، داستان یا نقد داری بپرس:")
 
     elif action == "genres":
         await query.message.reply_text("📂 **ژانر مورد نظرت رو انتخاب کن:**", parse_mode=ParseMode.MARKDOWN, reply_markup=genre_menu_keyboard())
@@ -611,8 +645,21 @@ async def on_genre_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     movie = await tmdb.get_by_genre(genre_id)
     if movie:
         await _send_movie(query, context, movie["id"])
-    else:
-        await query.message.reply_text("😕 فیلمی در این ژانر پیدا نشد.", reply_markup=back_to_menu_keyboard())
+
+
+async def on_similar_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":")[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    sim_movies = await tmdb.get_similar_movies(movie_id)
+    if not sim_movies:
+        await query.message.reply_text("😕 فیلم مشابهی پیدا نشد.", reply_markup=back_to_menu_keyboard())
+        return
+
+    lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in sim_movies[:6]]
+    await query.message.reply_text("🎭 **فیلم‌های مشابه پیشنهاد شده:**\n\n" + "\n".join(lines) + "\n\nبرای دیدن هرکدام اسم آن را بفرستید.", reply_markup=back_to_menu_keyboard())
 
 
 async def on_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -630,7 +677,8 @@ async def on_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
         db.remove_favorite(query.from_user.id, movie_id)
         await query.answer("از علاقه‌مندی‌ها حذف شد 💔")
 
-    trailer = get_youtube_trailer(await tmdb.get_movie_details(movie_id))
+    details = await tmdb.get_movie_details(movie_id)
+    trailer = get_youtube_trailer(details)
     new_kb = movie_actions_keyboard(movie_id, db.is_favorite(query.from_user.id, movie_id), trailer)
     await query.edit_message_reply_markup(reply_markup=new_kb)
 
@@ -670,7 +718,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.inline_query.answer(items)
 
 
-# --- TEXT MESSAGES & SEARCH ---
+# --- TEXT MESSAGES & AI SEARCH ---
 
 async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -678,28 +726,43 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = update.message.text.strip()
     tmdb: TMDbClient = context.bot_data["tmdb"]
+    gemini: Optional[GeminiClient] = context.bot_data.get("gemini")
+    mode = context.user_data.get("mode")
 
-    if context.user_data.get("awaiting_ai"):
-        context.user_data["awaiting_ai"] = False
-        gemini: GeminiClient = context.bot_data.get("gemini")
-        
-        msg = await update.message.reply_text("🤖 در حال فکر کردن و پیدا کردن بهترین پیشنهاد...")
+    # Mode 1: AI Recommendation Mode
+    if mode == "ai_recommendation" and gemini:
+        context.user_data["mode"] = None
+        msg = await update.message.reply_text("🧠 در حال آنالیز و پیدا کردن بهترین پیشنهاد...")
         try:
             suggested_title = await gemini.suggest_movie_title(text)
+            log.info("AI suggested title: '%s' for request: '%s'", suggested_title, text)
+            
             results = await tmdb.search_movies(suggested_title)
             await msg.delete()
             if results:
-                await update.message.reply_text(f"🧠 **پیشنهاد هوش مصنوعی:** `{suggested_title}`", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"💡 **پیشنهاد هوش مصنوعی:** `{suggested_title}`", parse_mode=ParseMode.MARKDOWN)
                 await _send_movie(update, context, results[0]["id"])
             else:
-                await update.message.reply_text("😕 متاسفانه فیلمی با پیشنهاد هوش مصنوعی پیدا نشد.")
-        except Exception:
-            await msg.edit_text("❌ خطایی در ارتباط با هوش مصنوعی رخ داد.")
+                await update.message.reply_text(f"😕 عنوان پیشنهادی `{suggested_title}` در TMDb یافت نشد.", parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
+        except Exception as e:
+            log.error("AI Error: %s", e)
+            await msg.edit_text("❌ خطایی در هوش مصنوعی رخ داد. دوباره تلاش کنید.")
         return
 
+    # Mode 2: AI Cinema Chat Mode
+    if mode == "ai_chat" and gemini:
+        msg = await update.message.reply_text("💭 در حال نوشتن پاسخ...")
+        try:
+            response = await gemini.chat_about_movies(text)
+            await msg.edit_text(response, reply_markup=back_to_menu_keyboard())
+        except Exception:
+            await msg.edit_text("❌ متاسفانه پاسخی دریافت نشد.")
+        return
+
+    # Default Mode: Direct Title/Name Search
     results = await tmdb.search_movies(text)
     if not results:
-        await update.message.reply_text("😕 فیلمی با این عنوان یافت نشد. دوباره تلاش کنید.", reply_markup=back_to_menu_keyboard())
+        await update.message.reply_text("😕 فیلم یا عنوانی پیدا نشد. نام را بررسی کنید.", reply_markup=back_to_menu_keyboard())
         return
 
     await _send_movie(update, context, results[0]["id"])
@@ -724,6 +787,7 @@ def build_application(config: Config) -> Application:
 
     app.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_genre_selected, pattern=r"^genre:"))
+    app.add_handler(CallbackQueryHandler(on_similar_selected, pattern=r"^similar:"))
     app.add_handler(CallbackQueryHandler(on_favorite_toggle, pattern=r"^(fav|unfav):"))
     app.add_handler(CallbackQueryHandler(on_show_favorite, pattern=r"^show_fav:"))
 
@@ -740,7 +804,7 @@ def main() -> None:
         log.critical("Startup failed: %s", exc)
         sys.exit(1)
 
-    log.info("Starting MovieBot Pro...")
+    log.info("Starting MovieBot Pro Max...")
     app = build_application(config)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
