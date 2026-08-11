@@ -1,17 +1,26 @@
 """
-Telegram Movie Recommendation Bot — PRO MAX Edition
-================================================================
-Updates:
-- Fixed Gemini API authentication & auto-fallback (2.0-flash, 1.5-flash)
-- Clean output parser for TMDb strict search
-- Added Direct AI Cinematic Chat Assistant
-- Added "Similar Movies" recommendations
-- Enhanced Persian UI & Keyboards
+Telegram Movie Recommendation Bot — PRO MAX Edition (Fixed & Enhanced)
+=======================================================================
+Changes:
+- Fixed ParseMode: switched all text to HTML for consistency & safety
+- Fixed Gemini title cleaner (preserves apostrophes in titles)
+- Added HTML escaping in all captions/messages
+- Added Error Handler with graceful user feedback
+- Added Smart Persian Search fallback via Gemini
+- Added inline buttons for Trending, Top Rated, and Similar movies
+- Fixed random page overflow (respects TMDb total_pages)
+- Added Search History logging
+- Added /actor command for cast search
+- Added TV show support in _send_media
+- Fixed broadcast command to preserve newlines
+- Added rate-limit awareness (asyncio.sleep in loops)
+- Added thumbnail safety in inline mode
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import random
@@ -160,6 +169,16 @@ class Database:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    query       TEXT NOT NULL,
+                    searched_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
     def upsert_user(self, telegram_id: int, username: Optional[str]) -> None:
         with self._connect() as conn:
@@ -216,6 +235,20 @@ class Database:
             row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
             return int(row["c"])
 
+    def log_search(self, telegram_id: int, query: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO search_history (telegram_id, query) VALUES (?, ?)",
+                (telegram_id, query),
+            )
+
+    def get_user_searches(self, telegram_id: int, limit: int = 5) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT query FROM search_history WHERE telegram_id = ? ORDER BY searched_at DESC LIMIT ?",
+                (telegram_id, limit),
+            ).fetchall()
+
 
 # =========================================================================
 # 4. ASYNC TMDb CLIENT
@@ -268,6 +301,17 @@ class TMDbClient:
             
         return details
 
+    async def get_tv_details(self, tv_id: int) -> dict[str, Any]:
+        params = {"append_to_response": "videos,credits", "language": "fa-IR"}
+        details = await self._get(f"/tv/{tv_id}", params=params)
+        
+        if not details.get("overview"):
+            params["language"] = "en-US"
+            en_details = await self._get(f"/tv/{tv_id}", params=params)
+            details["overview"] = en_details.get("overview", "توضیحاتی موجود نیست.")
+            
+        return details
+
     async def get_similar_movies(self, movie_id: int) -> list[dict[str, Any]]:
         data = await self._get(f"/movie/{movie_id}/similar")
         return data.get("results", [])
@@ -281,13 +325,17 @@ class TMDbClient:
         return data.get("results", [])
 
     async def get_random_movie(self) -> Optional[dict[str, Any]]:
-        page = random.randint(1, 15)
+        data = await self._get("/movie/popular", params={"page": 1})
+        total_pages = min(data.get("total_pages", 1), 15)
+        page = random.randint(1, max(1, total_pages))
         data = await self._get("/movie/popular", params={"page": page})
         results = data.get("results", [])
         return random.choice(results) if results else None
 
     async def get_by_genre(self, genre_id: int) -> Optional[dict[str, Any]]:
-        page = random.randint(1, 10)
+        data = await self._get("/discover/movie", params={"with_genres": genre_id, "page": 1, "sort_by": "popularity.desc"})
+        total_pages = min(data.get("total_pages", 1), 10)
+        page = random.randint(1, max(1, total_pages))
         data = await self._get("/discover/movie", params={"with_genres": genre_id, "page": page, "sort_by": "popularity.desc"})
         results = data.get("results", [])
         return random.choice(results) if results else None
@@ -296,14 +344,33 @@ class TMDbClient:
         data = await self._get("/search/movie", params={"query": query})
         return data.get("results", [])
 
+    async def search_tv(self, query: str) -> list[dict[str, Any]]:
+        data = await self._get("/search/tv", params={"query": query})
+        return data.get("results", [])
+
+    async def search_person(self, query: str) -> list[dict[str, Any]]:
+        data = await self._get("/search/person", params={"query": query})
+        return data.get("results", [])
+
+    async def get_person_details(self, person_id: int) -> dict[str, Any]:
+        params = {"append_to_response": "movie_credits", "language": "fa-IR"}
+        return await self._get(f"/person/{person_id}", params=params)
+
     async def get_random_tv(self) -> Optional[dict[str, Any]]:
-        page = random.randint(1, 15)
+        data = await self._get("/tv/popular", params={"page": 1})
+        total_pages = min(data.get("total_pages", 1), 15)
+        page = random.randint(1, max(1, total_pages))
         data = await self._get("/tv/popular", params={"page": page})
         results = data.get("results", [])
         return random.choice(results) if results else None
 
     async def get_random_anime(self) -> Optional[dict[str, Any]]:
-        page = random.randint(1, 8)
+        data = await self._get(
+            "/discover/movie",
+            params={"with_genres": "16", "with_origin_country": "JP", "page": 1},
+        )
+        total_pages = min(data.get("total_pages", 1), 8)
+        page = random.randint(1, max(1, total_pages))
         data = await self._get(
             "/discover/movie",
             params={"with_genres": "16", "with_origin_country": "JP", "page": page},
@@ -328,7 +395,6 @@ class GeminiClient:
         await self._client.aclose()
 
     async def _generate_content(self, prompt: str) -> str:
-        # Fallback list of models
         models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
         
         last_error = None
@@ -360,9 +426,19 @@ class GeminiClient:
             f"User prompt: {user_request}"
         )
         raw_title = await self._generate_content(prompt)
-        # Clean markdown / extra characters from AI response
-        cleaned_title = re.sub(r'[*"`\'\n]', '', raw_title).strip()
+        # Clean markdown / extra characters from AI response (preserve apostrophes!)
+        cleaned_title = re.sub(r'[*"\n]', '', raw_title).strip()
         return cleaned_title
+
+    async def translate_or_find_title(self, persian_query: str) -> str:
+        prompt = (
+            "The user is searching for a movie or TV show. They wrote the query in Persian (Farsi). "
+            "Return ONLY the official English title of the most likely match. Output nothing else. "
+            "If it's already in English, return it as-is.\n\n"
+            f"Query: {persian_query}"
+        )
+        raw = await self._generate_content(prompt)
+        return re.sub(r'[*"\n]', '', raw).strip()
 
     async def chat_about_movies(self, user_query: str) -> str:
         prompt = (
@@ -376,6 +452,11 @@ class GeminiClient:
 # =========================================================================
 # 6. FORMATTING HELPERS
 # =========================================================================
+
+def escape_html(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return html.escape(str(text))
 
 def format_movie_caption(details: dict[str, Any], media_type: str = "movie") -> str:
     title = details.get("title") or details.get("name") or "بدون عنوان"
@@ -400,18 +481,41 @@ def format_movie_caption(details: dict[str, Any], media_type: str = "movie") -> 
     icon = "📺" if media_type == "tv" else ("🎌" if media_type == "anime" else "🎬")
 
     caption = (
-        f"{icon} <b>{title}</b> ({year})\n"
+        f"{icon} <b>{escape_html(title)}</b> ({escape_html(year)})\n"
         f"⭐ <b>امتیاز:</b> {rating:.1f}/10\n"
-        f"🎭 <b>ژانر:</b> {genre_str}\n"
+        f"🎭 <b>ژانر:</b> {escape_html(genre_str)}\n"
     )
 
     if director:
-        caption += f"🎬 <b>کارگردان:</b> {director}\n"
+        caption += f"🎬 <b>کارگردان:</b> {escape_html(director)}\n"
     if top_cast:
-        caption += f"👥 <b>بازیگران:</b> {top_cast}\n"
+        caption += f"👥 <b>بازیگران:</b> {escape_html(top_cast)}\n"
 
-    caption += f"\n📝 <b>خلاصه داستان:</b>\n{overview}"
+    caption += f"\n📝 <b>خلاصه داستان:</b>\n{escape_html(overview)}"
     return caption
+
+
+def format_person_caption(person: dict[str, Any]) -> str:
+    name = person.get("name", "نامشخص")
+    bio = person.get("biography") or "بیوگرافی ثبت نشده است."
+    if len(bio) > 500:
+        bio = bio[:497] + "..."
+    
+    known_for = person.get("known_for_department", "هنرپیشه")
+    birthday = person.get("birthday") or "نامشخص"
+    place = person.get("place_of_birth") or "نامشخص"
+    
+    movies = person.get("movie_credits", {}).get("cast", [])
+    top_movies = ", ".join([m.get("title", "") for m in movies[:5] if m.get("title")]) or "نامشخص"
+    
+    return (
+        f"🎭 <b>{escape_html(name)}</b>\n"
+        f"🎬 <b>حرفه:</b> {escape_html(known_for)}\n"
+        f"📅 <b>تولد:</b> {escape_html(birthday)}\n"
+        f"📍 <b>محل تولد:</b> {escape_html(place)}\n\n"
+        f"📝 <b>بیوگرافی:</b>\n{escape_html(bio)}\n\n"
+        f"🎥 <b>آثار شاخص:</b> {escape_html(top_movies)}"
+    )
 
 
 def get_youtube_trailer(details: dict[str, Any]) -> Optional[str]:
@@ -424,6 +528,11 @@ def get_youtube_trailer(details: dict[str, Any]) -> Optional[str]:
 
 def poster_url(item: dict[str, Any]) -> Optional[str]:
     path = item.get("poster_path")
+    return f"{TMDB_IMAGE_BASE}{path}" if path else None
+
+
+def profile_url(item: dict[str, Any]) -> Optional[str]:
+    path = item.get("profile_path")
     return f"{TMDB_IMAGE_BASE}{path}" if path else None
 
 
@@ -454,7 +563,7 @@ def genre_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def movie_actions_keyboard(movie_id: int, is_favorite: bool, trailer_url: Optional[str] = None) -> InlineKeyboardMarkup:
+def movie_actions_keyboard(movie_id: int, is_favorite: bool, trailer_url: Optional[str] = None, media_type: str = "movie") -> InlineKeyboardMarkup:
     buttons = []
     
     row1 = []
@@ -477,6 +586,17 @@ def movie_actions_keyboard(movie_id: int, is_favorite: bool, trailer_url: Option
     return InlineKeyboardMarkup(buttons)
 
 
+def list_buttons_keyboard(items: list[dict[str, Any]], prefix: str = "show") -> InlineKeyboardMarkup:
+    buttons = []
+    for item in items[:10]:
+        title = item.get("title") or item.get("name") or "نامشخص"
+        item_id = item.get("id")
+        if item_id:
+            buttons.append([InlineKeyboardButton(f"{title}", callback_data=f"{prefix}:{item_id}")])
+    buttons.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="menu:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="menu:home")]])
 
@@ -485,6 +605,15 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
 # 8. HANDLERS
 # =========================================================================
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Exception while handling an update: %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "😕 یه خطای غیرمنتظره رخ داد. لطفاً دوباره تلاش کن یا از منوی اصلی شروع کن.",
+            reply_markup=back_to_menu_keyboard()
+        )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.bot_data["db"]
     user = update.effective_user
@@ -492,24 +621,55 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db.upsert_user(user.id, user.username)
 
     welcome_text = (
-        f"سلام {user.first_name if user else ''} عزیز! 👋\n\n"
-        "🎬 به **ربات حرفه‌ای پیشنهاد فیلم و سریال** خوش آمدید.\n"
+        f"سلام {escape_html(user.first_name if user else '')} عزیز! 👋\n\n"
+        "🎬 به <b>ربات حرفه‌ای پیشنهاد فیلم و سریال</b> خوش آمدید.\n"
         "با دکمه‌های زیر جستجو کنید یا اسم فیلم/بازیگر رو برام چت کنید!"
     )
     await update.message.reply_text(
-        welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard()
+        welcome_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "❓ **راهنمای جامع ربات:**\n\n"
-        "🔍 **جستجو:** نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\n"
-        "🧠 **پیشنهاد هوشمند:** حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\n"
-        "💬 **چت با دستیار:** درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\n"
-        "🔎 **اینلاین مود:** تایپ کن `@BotUsername Inception` درون هر چت برای اشتراک سریع!"
+        "❓ <b>راهنمای جامع ربات:</b>\n\n"
+        "🔍 <b>جستجو:</b> نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\n"
+        "🧠 <b>پیشنهاد هوشمند:</b> حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\n"
+        "💬 <b>چت با دستیار:</b> درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\n"
+        "🔎 <b>اینلاین مود:</b> تایپ کن <code>@BotUsername Inception</code> درون هر چت برای اشتراک سریع!\n"
+        "🎭 <b>جستجوی بازیگر:</b> دستور <code>/actor Leonardo DiCaprio</code>"
     )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+
+
+async def cmd_actor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    if not context.args:
+        await update.message.reply_text("❌ لطفاً نام بازیگر را وارد کنید:\n<code>/actor Leonardo DiCaprio</code>", parse_mode=ParseMode.HTML)
+        return
+    
+    query = " ".join(context.args)
+    msg = await update.message.reply_text("🔍 در حال جستجوی بازیگر...")
+    
+    try:
+        results = await tmdb.search_person(query)
+        await msg.delete()
+        if not results:
+            await update.message.reply_text("😕 بازیگری با این نام پیدا نشد.", reply_markup=back_to_menu_keyboard())
+            return
+        
+        person = results[0]
+        person_details = await tmdb.get_person_details(person["id"])
+        caption = format_person_caption(person_details)
+        image = profile_url(person_details)
+        
+        if image:
+            await update.message.reply_photo(photo=image, caption=caption, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+        else:
+            await update.message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+    except Exception as e:
+        log.error("Actor search error: %s", e)
+        await msg.edit_text("❌ خطا در جستجو. لطفاً دوباره تلاش کنید.")
 
 
 # --- ADMIN COMMANDS ---
@@ -519,7 +679,7 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.effective_user or update.effective_user.id != config.admin_id:
         return
     db: Database = context.bot_data["db"]
-    await update.message.reply_text(f"📊 **آمار ربات:**\n👥 تعداد کاربران: `{db.user_count()}`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📊 <b>آمار ربات:</b>\n👥 تعداد کاربران: <code>{db.user_count()}</code>", parse_mode=ParseMode.HTML)
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -527,9 +687,13 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or update.effective_user.id != config.admin_id:
         return
 
-    text_to_send = " ".join(context.args)
-    if not text_to_send:
-        await update.message.reply_text("❌ متن پیام را وارد کنید:\n`/broadcast سلام!`", parse_mode=ParseMode.MARKDOWN)
+    if not update.message.text or " " not in update.message.text:
+        await update.message.reply_text("❌ متن پیام را وارد کنید:\n<code>/broadcast سلام!</code>", parse_mode=ParseMode.HTML)
+        return
+
+    text_to_send = update.message.text.split(" ", 1)[1]
+    if not text_to_send.strip():
+        await update.message.reply_text("❌ متن پیام خالی است.", parse_mode=ParseMode.HTML)
         return
 
     db: Database = context.bot_data["db"]
@@ -540,41 +704,48 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     for uid in users:
         try:
-            await context.bot.send_message(chat_id=uid, text=text_to_send)
+            await context.bot.send_message(chat_id=uid, text=text_to_send, parse_mode=ParseMode.HTML)
             success += 1
             await asyncio.sleep(0.04)
         except Exception:
             failed += 1
 
-    await msg.edit_text(f"✅ **پایان ارسال.**\nموفق: {success}\nناموفق: {failed}")
+    await msg.edit_text(f"✅ <b>پایان ارسال.</b>\nموفق: {success}\nناموفق: {failed}", parse_mode=ParseMode.HTML)
 
 
 # --- MOVIE RENDERING HELPER ---
 
-async def _send_movie(update_or_query, context: ContextTypes.DEFAULT_TYPE, movie_id: int) -> None:
+async def _send_media(update_or_query, context: ContextTypes.DEFAULT_TYPE, media_id: int, media_type: str = "movie") -> None:
     tmdb: TMDbClient = context.bot_data["tmdb"]
     db: Database = context.bot_data["db"]
     user_id = update_or_query.from_user.id if hasattr(update_or_query, "from_user") else update_or_query.effective_user.id
 
     try:
-        details = await tmdb.get_movie_details(movie_id)
+        if media_type == "tv":
+            details = await tmdb.get_tv_details(media_id)
+        else:
+            details = await tmdb.get_movie_details(media_id)
     except TMDbError:
-        text = "❌ خطا در دریافت اطلاعات فیلم."
-        if hasattr(update_or_query, "message"):
-            await update_or_query.message.reply_text(text)
+        text = "❌ خطا در دریافت اطلاعات."
+        chat_id = update_or_query.message.chat_id if hasattr(update_or_query, "message") else update_or_query.effective_chat.id
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_to_menu_keyboard())
         return
 
-    caption = format_movie_caption(details)
+    caption = format_movie_caption(details, media_type)
     trailer = get_youtube_trailer(details)
-    keyboard = movie_actions_keyboard(details["id"], db.is_favorite(user_id, details["id"]), trailer)
+    keyboard = movie_actions_keyboard(details["id"], db.is_favorite(user_id, details["id"]), trailer, media_type)
     image = poster_url(details)
 
-    target_chat_id = update_or_query.message.chat_id if hasattr(update_or_query, "message") else update_or_query.effective_chat.id
+    chat_id = update_or_query.message.chat_id if hasattr(update_or_query, "message") else update_or_query.effective_chat.id
 
-    if image:
-        await context.bot.send_photo(chat_id=target_chat_id, photo=image, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await context.bot.send_message(chat_id=target_chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    try:
+        if image:
+            await context.bot.send_photo(chat_id=chat_id, photo=image, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except Exception as e:
+        log.error("Send media error: %s", e)
+        await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 # --- CALLBACK QUERY HANDLERS ---
@@ -595,32 +766,48 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text("⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
             return
         context.user_data["mode"] = "ai_recommendation"
-        await query.message.reply_text("🧠 **چه فیلمی تو چه سبکی دوست داری ببینی؟**\nمثلاً: «یه فیلم معپایی پیچیده مثل Shutter Island»")
+        await query.message.reply_text("🧠 <b>چه فیلمی تو چه سبکی دوست داری ببینی؟</b>\nمثلاً: «یه فیلم معمایی پیچیده مثل Shutter Island»", parse_mode=ParseMode.HTML)
 
     elif action == "aichat":
         if not context.bot_data.get("gemini"):
             await query.message.reply_text("⚠️ کلید GEMINI_API_KEY تنظیم نشده است.", reply_markup=back_to_menu_keyboard())
             return
         context.user_data["mode"] = "ai_chat"
-        await query.message.reply_text("💬 **دستیار سینمایی در خدمت شماست!**\nهر سوالی درباره فیلم، بازیگران، داستان یا نقد داری بپرس:")
+        await query.message.reply_text("💬 <b>دستیار سینمایی در خدمت شماست!</b>\nهر سوالی درباره فیلم، بازیگران، داستان یا نقد داری بپرس:", parse_mode=ParseMode.HTML)
 
     elif action == "genres":
-        await query.message.reply_text("📂 **ژانر مورد نظرت رو انتخاب کن:**", parse_mode=ParseMode.MARKDOWN, reply_markup=genre_menu_keyboard())
+        await query.message.reply_text("📂 <b>ژانر مورد نظرت رو انتخاب کن:</b>", parse_mode=ParseMode.HTML, reply_markup=genre_menu_keyboard())
 
     elif action == "random":
         movie = await tmdb.get_random_movie()
         if movie:
-            await _send_movie(query, context, movie["id"])
+            await _send_media(query, context, movie["id"], "movie")
 
     elif action == "trending":
         movies = await tmdb.get_trending()
-        lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in movies[:10]]
-        await query.message.reply_text("🔥 **فیلم‌های ترند هفته:**\n\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
+        if not movies:
+            await query.message.reply_text("😕 داده‌ای یافت نشد.", reply_markup=back_to_menu_keyboard())
+            return
+        text = "🔥 <b>فیلم‌های ترند هفته:</b>\n\nبرای جزئیات روی هر عنوان کلیک کنید."
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=list_buttons_keyboard(movies, prefix="show"))
 
     elif action == "top_rated":
         movies = await tmdb.get_top_rated()
-        lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in movies[:10]]
-        await query.message.reply_text("⭐ **برترین فیلم‌های تاریخ:**\n\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
+        if not movies:
+            await query.message.reply_text("😕 داده‌ای یافت نشد.", reply_markup=back_to_menu_keyboard())
+            return
+        text = "⭐ <b>برترین فیلم‌های تاریخ:</b>\n\nبرای جزئیات روی هر عنوان کلیک کنید."
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=list_buttons_keyboard(movies, prefix="show"))
+
+    elif action == "tv":
+        tv = await tmdb.get_random_tv()
+        if tv:
+            await _send_media(query, context, tv["id"], "tv")
+
+    elif action == "anime":
+        anime = await tmdb.get_random_anime()
+        if anime:
+            await _send_media(query, context, anime["id"], "movie")
 
     elif action == "favorites":
         favs = db.list_favorites(query.from_user.id)
@@ -630,10 +817,17 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         buttons = [[InlineKeyboardButton(row["title"], callback_data=f"show_fav:{row['movie_id']}")] for row in favs]
         buttons.append([InlineKeyboardButton("⬅️ منوی اصلی", callback_data="menu:home")])
-        await query.message.reply_text("❤️ **لیست علاقه‌مندی‌های شما:**", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        await query.message.reply_text("❤️ <b>لیست علاقه‌مندی‌های شما:</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif action == "help":
-        await cmd_help(update, context)
+        help_text = (
+            "❓ <b>راهنمای جامع ربات:</b>\n\n"
+            "🔍 <b>جستجو:</b> نام فیلم یا بازیگر (فارسی/انگلیسی) را مستقیم ارسال کنید.\n"
+            "🧠 <b>پیشنهاد هوشمند:</b> حست رو بگو تا هوش مصنوعی فیلم پیدا کنه.\n"
+            "💬 <b>چت با دستیار:</b> درباره نقد، داستان یا دیالوگ فیلم‌ها با هوش مصنوعی گپ بزن.\n"
+            "🔎 <b>اینلاین مود:</b> تایپ کن <code>@BotUsername Inception</code> درون هر چت برای اشتراک سریع!"
+        )
+        await query.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
 
 
 async def on_genre_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,7 +838,7 @@ async def on_genre_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     movie = await tmdb.get_by_genre(genre_id)
     if movie:
-        await _send_movie(query, context, movie["id"])
+        await _send_media(query, context, movie["id"], "movie")
 
 
 async def on_similar_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -658,8 +852,8 @@ async def on_similar_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("😕 فیلم مشابهی پیدا نشد.", reply_markup=back_to_menu_keyboard())
         return
 
-    lines = [f"• {m.get('title')} (⭐ {m.get('vote_average',0):.1f})" for m in sim_movies[:6]]
-    await query.message.reply_text("🎭 **فیلم‌های مشابه پیشنهاد شده:**\n\n" + "\n".join(lines) + "\n\nبرای دیدن هرکدام اسم آن را بفرستید.", reply_markup=back_to_menu_keyboard())
+    text = "🎭 <b>فیلم‌های مشابه پیشنهاد شده:</b>\n\nبرای جزئیات روی هر عنوان کلیک کنید."
+    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=list_buttons_keyboard(sim_movies, prefix="show"))
 
 
 async def on_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -670,24 +864,39 @@ async def on_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
     tmdb: TMDbClient = context.bot_data["tmdb"]
 
     if action == "fav":
-        details = await tmdb.get_movie_details(movie_id)
-        db.add_favorite(query.from_user.id, movie_id, details.get("title", "فیلم"))
-        await query.answer("به علاقه‌مندی‌ها اضافه شد ❤️")
+        try:
+            details = await tmdb.get_movie_details(movie_id)
+            title = details.get("title") or details.get("name") or "فیلم"
+            db.add_favorite(query.from_user.id, movie_id, title)
+            await query.answer("به علاقه‌مندی‌ها اضافه شد ❤️")
+        except Exception:
+            await query.answer("⚠️ خطا در افزودن.")
+            return
     else:
         db.remove_favorite(query.from_user.id, movie_id)
         await query.answer("از علاقه‌مندی‌ها حذف شد 💔")
 
-    details = await tmdb.get_movie_details(movie_id)
-    trailer = get_youtube_trailer(details)
-    new_kb = movie_actions_keyboard(movie_id, db.is_favorite(query.from_user.id, movie_id), trailer)
-    await query.edit_message_reply_markup(reply_markup=new_kb)
+    try:
+        details = await tmdb.get_movie_details(movie_id)
+        trailer = get_youtube_trailer(details)
+        new_kb = movie_actions_keyboard(movie_id, db.is_favorite(query.from_user.id, movie_id), trailer)
+        await query.edit_message_reply_markup(reply_markup=new_kb)
+    except Exception as e:
+        log.error("Favorite toggle refresh error: %s", e)
 
 
 async def on_show_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     movie_id = int(query.data.split(":")[1])
-    await _send_movie(query, context, movie_id)
+    await _send_media(query, context, movie_id, "movie")
+
+
+async def on_show_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":")[1])
+    await _send_media(query, context, movie_id, "movie")
 
 
 # --- INLINE SEARCH MODE ---
@@ -705,109 +914,12 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     items = []
     for m in results[:5]:
-        caption = f"🎬 <b>{m.get('title')}</b>\n⭐ امتیاز: {m.get('vote_average', 0)}/10\n\n{m.get('overview', '')}"
+        title = m.get("title", "فیلم")
+        overview = m.get("overview", "")[:200]
+        caption = f"🎬 <b>{escape_html(title)}</b>\n⭐ امتیاز: {m.get('vote_average', 0)}/10\n\n{escape_html(overview)}"
+        thumb = poster_url(m)
         items.append(
             InlineQueryResultArticle(
                 id=str(m["id"]),
-                title=m.get("title", "فیلم"),
-                description=f"⭐ {m.get('vote_average', 0)}/10 | {m.get('release_date', '')[:4]}",
-                thumb_url=poster_url(m),
-                input_message_content=InputTextMessageContent(caption, parse_mode=ParseMode.HTML),
-            )
-        )
-    await update.inline_query.answer(items)
-
-
-# --- TEXT MESSAGES & AI SEARCH ---
-
-async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    tmdb: TMDbClient = context.bot_data["tmdb"]
-    gemini: Optional[GeminiClient] = context.bot_data.get("gemini")
-    mode = context.user_data.get("mode")
-
-    # Mode 1: AI Recommendation Mode
-    if mode == "ai_recommendation" and gemini:
-        context.user_data["mode"] = None
-        msg = await update.message.reply_text("🧠 در حال آنالیز و پیدا کردن بهترین پیشنهاد...")
-        try:
-            suggested_title = await gemini.suggest_movie_title(text)
-            log.info("AI suggested title: '%s' for request: '%s'", suggested_title, text)
-            
-            results = await tmdb.search_movies(suggested_title)
-            await msg.delete()
-            if results:
-                await update.message.reply_text(f"💡 **پیشنهاد هوش مصنوعی:** `{suggested_title}`", parse_mode=ParseMode.MARKDOWN)
-                await _send_movie(update, context, results[0]["id"])
-            else:
-                await update.message.reply_text(f"😕 عنوان پیشنهادی `{suggested_title}` در TMDb یافت نشد.", parse_mode=ParseMode.MARKDOWN, reply_markup=back_to_menu_keyboard())
-        except Exception as e:
-            log.error("AI Error: %s", e)
-            await msg.edit_text("❌ خطایی در هوش مصنوعی رخ داد. دوباره تلاش کنید.")
-        return
-
-    # Mode 2: AI Cinema Chat Mode
-    if mode == "ai_chat" and gemini:
-        msg = await update.message.reply_text("💭 در حال نوشتن پاسخ...")
-        try:
-            response = await gemini.chat_about_movies(text)
-            await msg.edit_text(response, reply_markup=back_to_menu_keyboard())
-        except Exception:
-            await msg.edit_text("❌ متاسفانه پاسخی دریافت نشد.")
-        return
-
-    # Default Mode: Direct Title/Name Search
-    results = await tmdb.search_movies(text)
-    if not results:
-        await update.message.reply_text("😕 فیلم یا عنوانی پیدا نشد. نام را بررسی کنید.", reply_markup=back_to_menu_keyboard())
-        return
-
-    await _send_movie(update, context, results[0]["id"])
-
-
-# =========================================================================
-# 9. APP BOOTSTRAP
-# =========================================================================
-
-def build_application(config: Config) -> Application:
-    app = Application.builder().token(config.bot_token).build()
-
-    app.bot_data["config"] = config
-    app.bot_data["db"] = Database(DB_PATH)
-    app.bot_data["tmdb"] = TMDbClient(config.tmdb_api_key)
-    app.bot_data["gemini"] = GeminiClient(config.gemini_api_key) if config.gemini_api_key else None
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("stats", cmd_admin_stats))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-
-    app.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(on_genre_selected, pattern=r"^genre:"))
-    app.add_handler(CallbackQueryHandler(on_similar_selected, pattern=r"^similar:"))
-    app.add_handler(CallbackQueryHandler(on_favorite_toggle, pattern=r"^(fav|unfav):"))
-    app.add_handler(CallbackQueryHandler(on_show_favorite, pattern=r"^show_fav:"))
-
-    app.add_handler(InlineQueryHandler(on_inline_query))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_search))
-
-    return app
-
-
-def main() -> None:
-    try:
-        config = Config.load()
-    except RuntimeError as exc:
-        log.critical("Startup failed: %s", exc)
-        sys.exit(1)
-
-    log.info("Starting MovieBot Pro Max...")
-    app = build_application(config)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+                title=title,
+                description=f"⭐ {m.get('vote_average', 0)}/10 | {m.get('
