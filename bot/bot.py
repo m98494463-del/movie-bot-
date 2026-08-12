@@ -1752,3 +1752,239 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if not results:
+            await update.message.reply_text(
+                f"😕 برای پیشنهاد «{suggested_title}» چیزی روی TMDb پیدا نشد.",
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+
+        await update.message.reply_text(
+            f"🧠 <b>پیشنهاد هوشمند:</b> {suggested_title}", parse_mode=ParseMode.HTML
+        )
+        await _send_movie(update, context, results[0], telegram_id)
+        return
+
+    # Handle person search
+    if context.user_data.get("awaiting_person_search"):
+        context.user_data["awaiting_person_search"] = False
+        try:
+            people = tmdb.search_person(query_text)
+        except TMDbError as exc:
+            log.error("Person search failed for '%s': %s", query_text, exc)
+            await update.message.reply_text("⚠️ Search is temporarily unavailable.")
+            return
+        if not people:
+            await update.message.reply_text(
+                f"😕 هنرمندی با نام «{query_text}» پیدا نشد.",
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+        await update.message.reply_text(
+            "🔍 <b>Search Results:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=person_results_keyboard(people),
+        )
+        return
+
+    # Regular movie search
+    db.add_search_history(telegram_id, query_text)
+
+    try:
+        results = tmdb.search_movies(query_text)
+    except TMDbError as exc:
+        log.error("TMDb search failed for query='%s': %s", query_text, exc)
+        await update.message.reply_text("⚠️ Search is temporarily unavailable. Please try again shortly.")
+        return
+
+    if not results:
+        await update.message.reply_text(
+            f"😕 No results found for \"{query_text}\". Try a different title.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    if len(results) == 1:
+        await _send_movie(update, context, results[0], telegram_id)
+    else:
+        await update.message.reply_text(
+            f"🔍 <b>Results for \"{query_text}\":</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_results_keyboard(results[:6], prefix="view"),
+        )
+
+
+# --- Inline query handler ---
+
+async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query.query.strip()
+    if not query:
+        return
+
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    try:
+        results = tmdb.search_movies(query)[:10]
+    except TMDbError:
+        return
+
+    articles = []
+    for movie in results:
+        title = movie.get("title") or "Untitled"
+        year = (movie.get("release_date") or "----")[:4]
+        overview = movie.get("overview") or "No description."
+        if len(overview) > 200:
+            overview = overview[:197] + "..."
+
+        articles.append(
+            InlineQueryResultArticle(
+                id=str(movie["id"]),
+                title=f"{title} ({year})",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎬 <b>{title}</b> ({year})\n⭐ {movie.get('vote_average', 0):.1f}/10\n\n{overview}",
+                    parse_mode=ParseMode.HTML,
+                ),
+                description=overview,
+                thumbnail_url=poster_url(movie) or "",
+            )
+        )
+
+    await update.inline_query.answer(articles, cache_time=300)
+
+
+# --- Error handler ---
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled exception while processing update: %s", context.error, exc_info=context.error)
+
+
+# =========================================================================
+# 11. JOBS
+# =========================================================================
+
+async def daily_recommendation_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a daily random movie recommendation to subscribed users."""
+    db: Database = context.bot_data["db"]
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    users = db.get_users_with_daily_enabled()
+
+    if not users:
+        return
+
+    movie = tmdb.get_random_movie()
+    if movie is None:
+        return
+
+    try:
+        details = tmdb.get_movie_details(movie["id"])
+    except TMDbError:
+        details = movie
+
+    caption = format_movie_caption(details)
+    image = poster_url(details)
+
+    for uid in users:
+        try:
+            if image:
+                await context.bot.send_photo(
+                    chat_id=uid,
+                    photo=image,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_to_menu_keyboard(),
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_to_menu_keyboard(),
+                )
+        except Exception as exc:
+            log.warning("Daily recommendation failed for user %s: %s", uid, exc)
+
+
+# =========================================================================
+# 12. APPLICATION BOOTSTRAP
+# =========================================================================
+
+def build_application(config: Config) -> Application:
+    application = (
+        Application.builder()
+        .token(config.bot_token)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_pool_timeout(30)
+        .build()
+    )
+
+    application.bot_data["config"] = config
+    application.bot_data["db"] = Database(DB_PATH)
+    application.bot_data["tmdb"] = TMDbClient(config.tmdb_api_key)
+    application.bot_data["gemini"] = (
+        GeminiClient(config.gemini_api_key) if config.gemini_api_key else None
+    )
+
+    # Commands
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    application.add_handler(CommandHandler("settings", cmd_settings))
+    application.add_handler(CommandHandler("history", cmd_history))
+
+    # Callbacks
+    application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(on_favorite_button, pattern=r"^(fav|unfav):"))
+    application.add_handler(CallbackQueryHandler(on_watchlist_button, pattern=r"^(wl|unwl):"))
+    application.add_handler(CallbackQueryHandler(on_rating_menu, pattern=r"^ratemenu:"))
+    application.add_handler(CallbackQueryHandler(on_rating_button, pattern=r"^rate:"))
+    application.add_handler(CallbackQueryHandler(on_similar_button, pattern=r"^similar:"))
+    application.add_handler(CallbackQueryHandler(on_recommendation_button, pattern=r"^rec:"))
+    application.add_handler(CallbackQueryHandler(on_reviews_button, pattern=r"^reviews:"))
+    application.add_handler(CallbackQueryHandler(on_genre_button, pattern=r"^genre:"))
+    application.add_handler(CallbackQueryHandler(on_collection_button, pattern=r"^collection:"))
+    application.add_handler(CallbackQueryHandler(on_view_button, pattern=r"^view:"))
+    application.add_handler(CallbackQueryHandler(on_person_button, pattern=r"^person:"))
+    application.add_handler(CallbackQueryHandler(on_page_button, pattern=r"^page:"))
+    application.add_handler(CallbackQueryHandler(on_settings_toggle, pattern=r"^(toggle|clear):"))
+
+    # Inline
+    application.add_handler(InlineQueryHandler(on_inline_query))
+
+    # Messages
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_search))
+
+    # Errors
+    application.add_error_handler(on_error)
+
+    # Jobs
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(
+            daily_recommendation_job,
+            interval=86400,
+            first=3600,
+            name="daily_recommendation",
+        )
+
+    return application
+
+
+def main() -> None:
+    try:
+        config = Config.load()
+    except RuntimeError as exc:
+        log.critical("Startup failed: %s", exc)
+        sys.exit(1)
+
+    log.info("Starting MovieBot v%s...", __version__)
+    application = build_application(config)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
