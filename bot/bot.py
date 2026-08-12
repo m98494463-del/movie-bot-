@@ -1,10 +1,12 @@
 """
-Telegram Movie Recommendation Bot — MVP (Single File Edition)
-================================================================
+Telegram Movie Recommendation Bot — Full Edition
+=================================================
 
-A compact, production-usable Telegram bot that lets users discover movies
-via TMDb: random picks, search, top rated, trending, details, and a
-simple SQLite-backed favorites list.
+A production-ready single-file Telegram bot for movie discovery via TMDb.
+Features: random picks, search, trending, top-rated, now playing, upcoming,
+genres, collections, TV shows, anime, favorites, watchlist, ratings, search
+history, inline mode, AI recommendations, daily jobs, admin broadcast,
+person search, reviews, and user settings.
 
 --------------------------------------------------------------
 SETUP
@@ -16,17 +18,10 @@ SETUP
      BOT_TOKEN=your_telegram_bot_token
      TMDB_API_KEY=your_tmdb_api_key
      ADMIN_ID=123456789          # optional, your numeric Telegram ID
+     GEMINI_API_KEY=your_key     # optional, for AI recommendations
 
 3) Run:
      python movie_bot.py
-
---------------------------------------------------------------
-WHY A SINGLE FILE?
---------------------------------------------------------------
-This is intentionally an MVP: fewer moving parts, easy to read top to
-bottom, easy to deploy. Sections below are clearly separated by comment
-banners so it can be split into modules later (config.py, database.py,
-tmdb.py, keyboards.py, handlers.py) without redesigning anything.
 """
 
 from __future__ import annotations
@@ -36,6 +31,7 @@ import os
 import random
 import sqlite3
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +43,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -54,16 +52,13 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
 
 # =========================================================================
 # 1. CONFIG
-# -------------------------------------------------------------------------
-# Why this section exists: centralizes and validates every environment
-# variable in one place so the bot fails fast (at startup) instead of
-# crashing later mid-conversation with a confusing error.
 # =========================================================================
 
 load_dotenv()
@@ -76,6 +71,8 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 DB_PATH = DATA_DIR / "movie_bot.db"
 LOG_PATH = LOGS_DIR / "bot.log"
+
+__version__ = "2.0.0"
 
 
 @dataclass(frozen=True)
@@ -122,13 +119,11 @@ class Config:
 
 # =========================================================================
 # 2. LOGGING
-# -------------------------------------------------------------------------
-# Why: every real bot needs visibility into errors and API failures once
-# it's out of your hands. Logs go to both console and a rotating-free
-# simple file (kept small on purpose for an MVP).
 # =========================================================================
 
 def setup_logging() -> logging.Logger:
+    from logging.handlers import RotatingFileHandler
+
     logger = logging.getLogger("movie_bot")
     logger.setLevel(logging.INFO)
 
@@ -140,7 +135,9 @@ def setup_logging() -> logging.Logger:
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(fmt)
 
-    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(fmt)
 
     logger.addHandler(console_handler)
@@ -152,15 +149,12 @@ log = setup_logging()
 
 
 # =========================================================================
-# 3. DATABASE (Repository Pattern, SQLite)
-# -------------------------------------------------------------------------
-# Why: isolates all SQL in one place. Handlers never write raw SQL — they
-# call repository methods. This makes a future swap to PostgreSQL a
-# matter of rewriting this class, not touching handler logic.
+# 3. DATABASE
 # =========================================================================
 
 class Database:
-    """Thin repository over SQLite for users and their favorite movies."""
+    """Repository over SQLite for users, favorites, watchlist, ratings,
+    search history, and user settings."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -204,6 +198,53 @@ class Database:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    movie_id    INTEGER NOT NULL,
+                    title       TEXT NOT NULL,
+                    added_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(telegram_id, movie_id),
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ratings (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    movie_id    INTEGER NOT NULL,
+                    rating      INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 10),
+                    rated_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(telegram_id, movie_id),
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    query       TEXT NOT NULL,
+                    searched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    telegram_id          INTEGER PRIMARY KEY,
+                    language             TEXT DEFAULT 'fa',
+                    daily_recommendation INTEGER DEFAULT 0,
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+                )
+                """
+            )
 
     def upsert_user(self, telegram_id: int, username: Optional[str]) -> None:
         with self._connect() as conn:
@@ -215,7 +256,12 @@ class Database:
                 """,
                 (telegram_id, username or ""),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_settings (telegram_id) VALUES (?)",
+                (telegram_id,),
+            )
 
+    # --- Favorites ---
     def add_favorite(self, telegram_id: int, movie_id: int, title: str) -> bool:
         try:
             with self._connect() as conn:
@@ -225,7 +271,7 @@ class Database:
                 )
             return True
         except sqlite3.IntegrityError:
-            return False  # already a favorite
+            return False
 
     def remove_favorite(self, telegram_id: int, movie_id: int) -> bool:
         with self._connect() as conn:
@@ -243,30 +289,189 @@ class Database:
             ).fetchone()
             return row is not None
 
-    def list_favorites(self, telegram_id: int) -> list[sqlite3.Row]:
+    def list_favorites(self, telegram_id: int, limit: int = 10, offset: int = 0) -> list[sqlite3.Row]:
         with self._connect() as conn:
             return conn.execute(
-                "SELECT movie_id, title FROM favorites WHERE telegram_id = ? ORDER BY added_at DESC",
-                (telegram_id,),
+                "SELECT movie_id, title FROM favorites WHERE telegram_id = ? ORDER BY added_at DESC LIMIT ? OFFSET ?",
+                (telegram_id, limit, offset),
             ).fetchall()
 
+    def count_favorites(self, telegram_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM favorites WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            return int(row["c"])
+
+    # --- Watchlist ---
+    def add_watchlist(self, telegram_id: int, movie_id: int, title: str) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO watchlist (telegram_id, movie_id, title) VALUES (?, ?, ?)",
+                    (telegram_id, movie_id, title),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_watchlist(self, telegram_id: int, movie_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM watchlist WHERE telegram_id = ? AND movie_id = ?",
+                (telegram_id, movie_id),
+            )
+            return cur.rowcount > 0
+
+    def is_watchlist(self, telegram_id: int, movie_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist WHERE telegram_id = ? AND movie_id = ?",
+                (telegram_id, movie_id),
+            ).fetchone()
+            return row is not None
+
+    def list_watchlist(self, telegram_id: int, limit: int = 10, offset: int = 0) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT movie_id, title FROM watchlist WHERE telegram_id = ? ORDER BY added_at DESC LIMIT ? OFFSET ?",
+                (telegram_id, limit, offset),
+            ).fetchall()
+
+    def count_watchlist(self, telegram_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM watchlist WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            return int(row["c"])
+
+    # --- Ratings ---
+    def add_rating(self, telegram_id: int, movie_id: int, rating: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ratings (telegram_id, movie_id, rating)
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_id, movie_id) DO UPDATE SET rating = excluded.rating, rated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_id, movie_id, rating),
+            )
+
+    def get_rating(self, telegram_id: int, movie_id: int) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rating FROM ratings WHERE telegram_id = ? AND movie_id = ?",
+                (telegram_id, movie_id),
+            ).fetchone()
+            return int(row["rating"]) if row else None
+
+    # --- Search History ---
+    def add_search_history(self, telegram_id: int, query: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO search_history (telegram_id, query) VALUES (?, ?)",
+                (telegram_id, query),
+            )
+            conn.execute(
+                """
+                DELETE FROM search_history
+                WHERE id NOT IN (
+                    SELECT id FROM search_history WHERE telegram_id = ? ORDER BY searched_at DESC LIMIT 50
+                ) AND telegram_id = ?
+                """,
+                (telegram_id, telegram_id),
+            )
+
+    def get_search_history(self, telegram_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT query, searched_at FROM search_history WHERE telegram_id = ? ORDER BY searched_at DESC LIMIT ?",
+                (telegram_id, limit),
+            ).fetchall()
+
+    def clear_search_history(self, telegram_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM search_history WHERE telegram_id = ?", (telegram_id,))
+
+    # --- User Settings ---
+    def get_user_settings(self, telegram_id: int) -> sqlite3.Row:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT language, daily_recommendation FROM user_settings WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            return row
+
+    def update_user_settings(self, telegram_id: int, **kwargs) -> None:
+        allowed = {"language", "daily_recommendation"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        with self._connect() as conn:
+            for col, val in updates.items():
+                conn.execute(
+                    f"UPDATE user_settings SET {col} = ? WHERE telegram_id = ?",
+                    (val, telegram_id),
+                )
+
+    # --- Admin / Stats ---
     def user_count(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
             return int(row["c"])
 
+    def get_all_user_ids(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT telegram_id FROM users").fetchall()
+            return [int(r["telegram_id"]) for r in rows]
+
+    def get_users_with_daily_enabled(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT telegram_id FROM user_settings WHERE daily_recommendation = 1"
+            ).fetchall()
+            return [int(r["telegram_id"]) for r in rows]
+
 
 # =========================================================================
-# 4. TMDb CLIENT
-# -------------------------------------------------------------------------
-# Why: a dedicated client keeps HTTP concerns (session reuse, timeouts,
-# retries, error handling) out of the bot logic entirely. Handlers only
-# ever see clean Python objects, never raw requests/response plumbing.
+# 4. CACHE
+# =========================================================================
+
+class SimpleCache:
+    """In-memory TTL cache for TMDb responses."""
+
+    def __init__(self, ttl_seconds: int = 300):
+        self._ttl = ttl_seconds
+        self._store: dict[str, tuple[float, Any]] = {}
+
+    def _key(self, *parts: Any) -> str:
+        return ":".join(str(p) for p in parts)
+
+    def get(self, *parts: Any) -> Any:
+        key = self._key(*parts)
+        if key in self._store:
+            ts, data = self._store[key]
+            if time.time() - ts < self._ttl:
+                return data
+            del self._store[key]
+        return None
+
+    def set(self, data: Any, *parts: Any) -> None:
+        self._store[self._key(*parts)] = (time.time(), data)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+# =========================================================================
+# 5. TMDb CLIENT
 # =========================================================================
 
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
-REQUEST_TIMEOUT = 8  # seconds
+REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
 
 
@@ -275,19 +480,23 @@ class TMDbError(Exception):
 
 
 class TMDbClient:
-    """Small wrapper around the TMDb REST API with retries and timeouts."""
+    """Wrapper around TMDb REST API with retries, timeouts, and caching."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
-        self._session = requests.Session()  # reused across all requests
+        self._session = requests.Session()
+        self._cache = SimpleCache(ttl_seconds=300)
 
-    def _get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def _get(self, path: str, params: Optional[dict[str, Any]] = None, use_cache: bool = True) -> dict[str, Any]:
         params = dict(params or {})
         params["api_key"] = self._api_key
-        # Persian by default so overviews/genre names come back translated;
-        # callers can override with language="en-US" for the fallback path.
         params.setdefault("language", "fa-IR")
         params.setdefault("include_adult", "false")
+
+        if use_cache:
+            cached = self._cache.get(path, sorted(params.items()))
+            if cached is not None:
+                return cached
 
         last_error: Optional[Exception] = None
         for attempt in range(1, MAX_RETRIES + 2):
@@ -296,71 +505,85 @@ class TMDbClient:
                     f"{TMDB_BASE_URL}{path}", params=params, timeout=REQUEST_TIMEOUT
                 )
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+                if use_cache:
+                    self._cache.set(data, path, sorted(params.items()))
+                return data
             except requests.RequestException as exc:
                 last_error = exc
                 log.warning("TMDb request failed (attempt %s): %s", attempt, exc)
         raise TMDbError(f"TMDb request to {path} failed after retries") from last_error
 
     def _with_overview_fallback(self, path: str, details: dict[str, Any]) -> dict[str, Any]:
-        # Not every title has a Persian translation on TMDb yet; if the
-        # Persian overview came back empty, fetch the English one instead
-        # of showing nothing.
         if not details.get("overview"):
             try:
-                en_details = self._get(path, params={"language": "en-US"})
+                en_details = self._get(path, params={"language": "en-US"}, use_cache=False)
                 details["overview"] = en_details.get("overview") or details.get("overview", "")
             except TMDbError:
                 pass
         return details
 
+    # --- Movies ---
     def get_trending(self) -> list[dict[str, Any]]:
-        data = self._get("/trending/movie/week")
-        return data.get("results", [])
+        return self._get("/trending/movie/week").get("results", [])
 
     def get_top_rated(self) -> list[dict[str, Any]]:
-        data = self._get("/movie/top_rated")
-        return data.get("results", [])
+        return self._get("/movie/top_rated").get("results", [])
+
+    def get_now_playing(self) -> list[dict[str, Any]]:
+        return self._get("/movie/now_playing").get("results", [])
+
+    def get_upcoming(self) -> list[dict[str, Any]]:
+        return self._get("/movie/upcoming").get("results", [])
 
     def get_random_movie(self) -> Optional[dict[str, Any]]:
-        # Pull from a popular-movies page for a reasonable "random but decent" pick.
         page = random.randint(1, 20)
-        data = self._get("/movie/popular", params={"page": page})
-        results = data.get("results", [])
+        results = self._get("/movie/popular", params={"page": page}).get("results", [])
         return random.choice(results) if results else None
 
     def search_movies(self, query: str) -> list[dict[str, Any]]:
-        data = self._get("/search/movie", params={"query": query})
-        return data.get("results", [])
+        return self._get("/search/movie", params={"query": query}).get("results", [])
 
     def get_movie_details(self, movie_id: int) -> dict[str, Any]:
-        details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos"})
+        details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos,credits"})
         return self._with_overview_fallback(f"/movie/{movie_id}", details)
 
     def get_similar_movies(self, movie_id: int) -> list[dict[str, Any]]:
-        data = self._get(f"/movie/{movie_id}/similar", params={"language": "en-US"})
-        return data.get("results", [])
+        return self._get(f"/movie/{movie_id}/similar", params={"language": "en-US"}).get("results", [])
 
+    def get_movie_recommendations(self, movie_id: int) -> list[dict[str, Any]]:
+        return self._get(f"/movie/{movie_id}/recommendations", params={"language": "en-US"}).get("results", [])
+
+    def get_movie_reviews(self, movie_id: int) -> list[dict[str, Any]]:
+        return self._get(f"/movie/{movie_id}/reviews").get("results", [])
+
+    # --- TV ---
     def get_tv_trending(self) -> list[dict[str, Any]]:
-        data = self._get("/trending/tv/week")
-        return data.get("results", [])
+        return self._get("/trending/tv/week").get("results", [])
 
     def get_random_tv(self) -> Optional[dict[str, Any]]:
         page = random.randint(1, 20)
-        data = self._get("/tv/popular", params={"page": page})
-        results = data.get("results", [])
+        results = self._get("/tv/popular", params={"page": page}).get("results", [])
         return random.choice(results) if results else None
 
     def get_tv_details(self, tv_id: int) -> dict[str, Any]:
         details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos"})
         return self._with_overview_fallback(f"/tv/{tv_id}", details)
 
+    def search_tv(self, query: str) -> list[dict[str, Any]]:
+        return self._get("/search/tv", params={"query": query}).get("results", [])
+
+    # --- People ---
+    def search_person(self, query: str) -> list[dict[str, Any]]:
+        return self._get("/search/person", params={"query": query}).get("results", [])
+
+    def get_person_details(self, person_id: int) -> dict[str, Any]:
+        return self._get(f"/person/{person_id}", params={"append_to_response": "movie_credits"})
+
+    # --- Discover ---
     def get_random_anime(self) -> Optional[dict[str, Any]]:
-        # TMDb has no dedicated "anime" flag, so this approximates it with
-        # the Animation genre (16) restricted to Japanese origin/language —
-        # the same heuristic most non-official anime trackers use.
         page = random.randint(1, 10)
-        data = self._get(
+        results = self._get(
             "/discover/movie",
             params={
                 "with_genres": "16",
@@ -368,8 +591,7 @@ class TMDbClient:
                 "sort_by": "popularity.desc",
                 "page": page,
             },
-        )
-        results = data.get("results", [])
+        ).get("results", [])
         return random.choice(results) if results else None
 
     def _discover_random(self, **extra_params: str) -> Optional[dict[str, Any]]:
@@ -377,8 +599,7 @@ class TMDbClient:
         params = dict(extra_params)
         params["page"] = str(page)
         params.setdefault("sort_by", "popularity.desc")
-        data = self._get("/discover/movie", params=params)
-        results = data.get("results", [])
+        results = self._get("/discover/movie", params=params).get("results", [])
         return random.choice(results) if results else None
 
     def get_random_by_genre(self, genre_id: str) -> Optional[dict[str, Any]]:
@@ -392,11 +613,7 @@ class TMDbClient:
 
 
 # =========================================================================
-# 4b. GEMINI CLIENT (free-text smart recommendations)
-# -------------------------------------------------------------------------
-# Why: turns a fuzzy request ("something like Interstellar", "a light
-# comedy for tonight") into one concrete movie title we can then look up
-# on TMDb — this is the "AI Ready" hook from the original spec.
+# 6. GEMINI CLIENT
 # =========================================================================
 
 GEMINI_MODEL = "gemini-3.6-flash"
@@ -415,7 +632,6 @@ class GeminiClient:
         self._session = requests.Session()
 
     def suggest_movie_title(self, user_request: str) -> str:
-        """Turns a free-text request into one concrete movie title to search for."""
         prompt = (
             "You are a movie recommendation assistant. Based on the user's "
             "request below (which may be in Persian or English), suggest "
@@ -444,16 +660,26 @@ class GeminiClient:
 
 
 # =========================================================================
-# 5. FORMATTING HELPERS
+# 7. FORMATTING HELPERS
 # =========================================================================
 
-def format_movie_caption(item: dict[str, Any], media_type: str = "movie") -> str:
-    """Builds the HTML-formatted caption shown with a poster.
+def _extract_director(crew: list[dict]) -> str:
+    for person in crew:
+        if person.get("job") == "Director":
+            return person.get("name", "Unknown")
+    return "Unknown"
 
-    Handles movies, TV shows, and anime (which is just a TV/movie result
-    with a different icon) — the underlying TMDb fields differ slightly
-    between movies ("title"/"release_date") and TV ("name"/"first_air_date").
-    """
+
+def _extract_top_cast(cast: list[dict], limit: int = 3) -> str:
+    names = [p.get("name", "") for p in cast[:limit] if p.get("name")]
+    return ", ".join(names) if names else "N/A"
+
+
+def format_movie_caption(
+    item: dict[str, Any],
+    media_type: str = "movie",
+    user_rating: Optional[int] = None,
+) -> str:
     if media_type == "tv":
         title = item.get("name") or item.get("original_name") or "بدون عنوان"
         date_value = item.get("first_air_date") or "----"
@@ -469,9 +695,13 @@ def format_movie_caption(item: dict[str, Any], media_type: str = "movie") -> str
 
     year = date_value[:4]
     rating = item.get("vote_average", 0)
+    vote_count = item.get("vote_count", 0)
     overview = item.get("overview") or "توضیحاتی برای این عنوان موجود نیست."
     if len(overview) > 500:
         overview = overview[:497] + "..."
+
+    tagline = item.get("tagline", "")
+    tagline_line = f"<i>{tagline}</i>\n\n" if tagline else ""
 
     genres = item.get("genres")
     genre_line = ""
@@ -484,22 +714,91 @@ def format_movie_caption(item: dict[str, Any], media_type: str = "movie") -> str
         episode_runtimes = item.get("episode_run_time") or []
         if episode_runtimes:
             runtime_line = f"⏱ <b>مدت هر قسمت:</b> {episode_runtimes[0]} دقیقه\n"
+        seasons = item.get("number_of_seasons")
+        episodes = item.get("number_of_episodes")
+        if seasons:
+            runtime_line += f"📊 <b>فصل:</b> {seasons} | <b>قسمت:</b> {episodes or 'N/A'}\n"
     else:
         runtime = item.get("runtime")
         if runtime:
-            runtime_line = f"⏱ <b>مدت زمان:</b> {runtime} دقیقه\n"
+            hours = runtime // 60
+            mins = runtime % 60
+            runtime_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+            runtime_line = f"⏱ <b>مدت زمان:</b> {runtime_str}\n"
+
+    credits = item.get("credits", {})
+    director = _extract_director(credits.get("crew", []))
+    top_cast = _extract_top_cast(credits.get("cast", []))
+    crew_line = f"🎬 <b>کارگردان:</b> {director}\n🎭 <b>بازیگران:</b> {top_cast}\n"
+
+    budget = item.get("budget")
+    revenue = item.get("revenue")
+    money_line = ""
+    if budget and budget > 0:
+        money_line += f"💰 <b>بودجه:</b> ${budget:,.0f}\n"
+    if revenue and revenue > 0:
+        money_line += f"💵 <b>فروش:</b> ${revenue:,.0f}\n"
+
+    companies = item.get("production_companies", [])
+    company_line = ""
+    if companies:
+        company_names = ", ".join(c["name"] for c in companies[:3])
+        company_line = f"🏢 <b>استودیو:</b> {company_names}\n"
+
+    user_rating_line = ""
+    if user_rating:
+        stars = "⭐" * (user_rating // 2) + ("½" if user_rating % 2 else "")
+        user_rating_line = f"\n🎯 <b>امتیاز شما:</b> {stars} ({user_rating}/10)"
 
     return (
         f"{icon} <b>{title}</b> ({year})\n"
-        f"⭐ <b>امتیاز:</b> {rating:.1f}/10\n"
+        f"⭐ <b>امتیاز:</b> {rating:.1f}/10 <i>({vote_count:,} رأی)</i>\n"
         f"{genre_line}"
-        f"{runtime_line}\n"
+        f"{runtime_line}"
+        f"{crew_line}"
+        f"{company_line}"
+        f"{money_line}"
+        f"\n{tagline_line}"
         f"{overview}"
+        f"{user_rating_line}"
     )
 
 
-def poster_url(movie: dict[str, Any]) -> Optional[str]:
-    path = movie.get("poster_path")
+def format_person_caption(person: dict[str, Any]) -> str:
+    name = person.get("name", "Unknown")
+    known_for = person.get("known_for_department", "")
+    birthday = person.get("birthday") or "N/A"
+    place = person.get("place_of_birth") or "N/A"
+    bio = person.get("biography") or "Biography not available."
+    if len(bio) > 600:
+        bio = bio[:597] + "..."
+
+    movie_credits = person.get("movie_credits", {})
+    cast = movie_credits.get("cast", [])
+    known_titles = ", ".join(m.get("title", "") for m in cast[:5] if m.get("title"))
+
+    return (
+        f"🎭 <b>{name}</b>\n"
+        f"🎬 <b>حرفه:</b> {known_for}\n"
+        f"🎂 <b>تولد:</b> {birthday}\n"
+        f"📍 <b>محل تولد:</b> {place}\n"
+        f"\n📝 <b>بیوگرافی:</b>\n{bio}\n"
+        f"\n🎞 <b>آثار شناخته‌شده:</b> {known_titles or 'N/A'}"
+    )
+
+
+def format_review(review: dict[str, Any]) -> str:
+    author = review.get("author", "Anonymous")
+    rating = review.get("author_details", {}).get("rating")
+    content = review.get("content", "")
+    if len(content) > 800:
+        content = content[:797] + "..."
+    rating_str = f"⭐ {rating}/10" if rating else ""
+    return f"📝 <b>نقد {author}</b> {rating_str}\n\n{content}"
+
+
+def poster_url(item: dict[str, Any]) -> Optional[str]:
+    path = item.get("poster_path") or item.get("profile_path")
     return f"{TMDB_IMAGE_BASE}{path}" if path else None
 
 
@@ -512,7 +811,7 @@ def get_youtube_trailer(item: dict[str, Any]) -> Optional[str]:
 
 
 # =========================================================================
-# 6. KEYBOARDS
+# 8. KEYBOARDS
 # =========================================================================
 
 GENRES: list[tuple[str, str]] = [
@@ -528,8 +827,6 @@ GENRES: list[tuple[str, str]] = [
     ("80", "🕵️ جنایی"),
 ]
 
-# (discover kind, TMDb id, label). kind "company" filters by studio,
-# "crew" filters by a person's crew credits (e.g. director).
 COLLECTIONS: list[tuple[str, str, str]] = [
     ("company", "420", "🦸 مارول"),
     ("company", "3", "🧸 پیکسار"),
@@ -537,18 +834,40 @@ COLLECTIONS: list[tuple[str, str, str]] = [
     ("crew", "525", "🎬 کریستوفر نولان"),
 ]
 
+PAGE_SIZE = 5
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("🧠 پیشنهاد هوشمند", callback_data="menu:ai")],
-        [InlineKeyboardButton("🎲 Random Movie", callback_data="menu:random")],
-        [InlineKeyboardButton("🔥 Trending", callback_data="menu:trending")],
-        [InlineKeyboardButton("⭐ Top Rated", callback_data="menu:top_rated")],
-        [InlineKeyboardButton("📺 سریال محبوب", callback_data="menu:tv")],
-        [InlineKeyboardButton("🎌 انیمه", callback_data="menu:anime")],
-        [InlineKeyboardButton("🎭 ژانرها", callback_data="menu:genres")],
-        [InlineKeyboardButton("🎬 مجموعه‌ها", callback_data="menu:collections")],
-        [InlineKeyboardButton("❤️ Favorites", callback_data="menu:favorites")],
+        [
+            InlineKeyboardButton("🎲 Random Movie", callback_data="menu:random"),
+            InlineKeyboardButton("🔥 Trending", callback_data="menu:trending"),
+        ],
+        [
+            InlineKeyboardButton("⭐ Top Rated", callback_data="menu:top_rated"),
+            InlineKeyboardButton("🆕 Now Playing", callback_data="menu:now_playing"),
+        ],
+        [
+            InlineKeyboardButton("📅 Upcoming", callback_data="menu:upcoming"),
+            InlineKeyboardButton("📺 TV Shows", callback_data="menu:tv"),
+        ],
+        [
+            InlineKeyboardButton("🎌 Anime", callback_data="menu:anime"),
+            InlineKeyboardButton("🎭 ژانرها", callback_data="menu:genres"),
+        ],
+        [
+            InlineKeyboardButton("🎬 مجموعه‌ها", callback_data="menu:collections"),
+            InlineKeyboardButton("🔍 Person Search", callback_data="menu:person"),
+        ],
+        [
+            InlineKeyboardButton("❤️ Favorites", callback_data="menu:favorites"),
+            InlineKeyboardButton("📋 Watchlist", callback_data="menu:watchlist"),
+        ],
+        [
+            InlineKeyboardButton("📜 History", callback_data="menu:history"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="menu:settings"),
+        ],
         [InlineKeyboardButton("❓ Help", callback_data="menu:help")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -580,7 +899,6 @@ def collections_keyboard() -> InlineKeyboardMarkup:
 
 
 def simple_actions_keyboard(refresh_action: str, refresh_label: str) -> InlineKeyboardMarkup:
-    """Lighter keyboard for TV/anime cards, which aren't stored in favorites."""
     buttons = [
         [InlineKeyboardButton(refresh_label, callback_data=f"menu:{refresh_action}")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
@@ -591,23 +909,109 @@ def simple_actions_keyboard(refresh_action: str, refresh_label: str) -> InlineKe
 def movie_actions_keyboard(
     movie_id: int,
     is_favorite: bool,
+    is_watchlist: bool,
+    user_rating: Optional[int],
     refresh_callback: str = "menu:random",
     refresh_label: str = "🎲 Another Random",
     trailer_url: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
-    fav_button = (
-        InlineKeyboardButton("💔 Remove Favorite", callback_data=f"unfav:{movie_id}")
-        if is_favorite
-        else InlineKeyboardButton("❤️ Add Favorite", callback_data=f"fav:{movie_id}")
-    )
-    top_row = [fav_button]
+    fav_label = "💔 Remove Favorite" if is_favorite else "❤️ Add Favorite"
+    wl_label = "➖ Remove Watchlist" if is_watchlist else "📋 Add Watchlist"
+    rate_label = f"⭐ Rate ({user_rating}/10)" if user_rating else "⭐ Rate"
+
+    top_row = [
+        InlineKeyboardButton(fav_label, callback_data=f"fav:{movie_id}"),
+        InlineKeyboardButton(wl_label, callback_data=f"wl:{movie_id}"),
+    ]
+    second_row = [
+        InlineKeyboardButton(rate_label, callback_data=f"ratemenu:{movie_id}"),
+    ]
     if trailer_url:
-        top_row.append(InlineKeyboardButton("🎬 تریلر", url=trailer_url))
+        second_row.append(InlineKeyboardButton("🎬 تریلر", url=trailer_url))
 
     buttons = [
         top_row,
-        [InlineKeyboardButton("👍 موارد مشابه", callback_data=f"similar:{movie_id}")],
+        second_row,
+        [
+            InlineKeyboardButton("👍 موارد مشابه", callback_data=f"similar:{movie_id}"),
+            InlineKeyboardButton("🎯 Recommendations", callback_data=f"rec:{movie_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Reviews", callback_data=f"reviews:{movie_id}"),
+        ],
         [InlineKeyboardButton(refresh_label, callback_data=refresh_callback)],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def rating_keyboard(movie_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton("⭐", callback_data=f"rate:{movie_id}:2"),
+            InlineKeyboardButton("⭐⭐", callback_data=f"rate:{movie_id}:4"),
+            InlineKeyboardButton("⭐⭐⭐", callback_data=f"rate:{movie_id}:6"),
+            InlineKeyboardButton("⭐⭐⭐⭐", callback_data=f"rate:{movie_id}:8"),
+            InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data=f"rate:{movie_id}:10"),
+        ],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"view:{movie_id}")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def list_pagination_keyboard(
+    current_page: int,
+    total_pages: int,
+    list_type: str,
+) -> InlineKeyboardMarkup:
+    buttons = []
+    nav = []
+    if current_page > 0:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"page:{list_type}:{current_page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {current_page + 1}/{total_pages}", callback_data="noop"))
+    if current_page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"page:{list_type}:{current_page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def search_results_keyboard(results: list[dict[str, Any]], prefix: str = "view") -> InlineKeyboardMarkup:
+    buttons = []
+    for i, item in enumerate(results[:6], 1):
+        title = item.get("title") or item.get("name") or "Untitled"
+        year = (item.get("release_date") or item.get("first_air_date") or "----")[:4]
+        buttons.append([InlineKeyboardButton(f"{i}. {title} ({year})", callback_data=f"{prefix}:{item['id']}")])
+    buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def person_results_keyboard(people: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    buttons = []
+    for i, person in enumerate(people[:6], 1):
+        name = person.get("name", "Unknown")
+        dept = person.get("known_for_department", "")
+        label = f"{i}. {name}" + (f" ({dept})" if dept else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"person:{person['id']}")])
+    buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def settings_keyboard(lang: str, daily: int) -> InlineKeyboardMarkup:
+    daily_label = "🔔 Daily: ON" if daily else "🔕 Daily: OFF"
+    buttons = [
+        [InlineKeyboardButton(daily_label, callback_data="toggle:daily")],
+        [InlineKeyboardButton("🗑 Clear History", callback_data="clear:history")],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin:broadcast")],
+        [InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -620,20 +1024,14 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 # =========================================================================
-# 7. GLOBALS WIRED AT STARTUP
-# -------------------------------------------------------------------------
-# Why module-level globals here (instead of dependency injection through
-# every function signature): python-telegram-bot handlers only receive
-# (update, context). context.bot_data is the officially supported place
-# to stash shared services — so we store db/tmdb there at startup and
-# fetch them inside each handler. This keeps handlers testable without
-# real globals leaking across the whole file.
+# 9. GLOBALS
 # =========================================================================
 
 WELCOME_TEXT = (
     "🎬 <b>Welcome to MovieBot!</b>\n\n"
     "I help you discover movies to watch — trending picks, top-rated "
-    "classics, random surprises, and search by title.\n\n"
+    "classics, random surprises, search by title, TV shows, anime, "
+    "person search, favorites, watchlist, ratings, and more.\n\n"
     "Use the menu below to get started, or just type a movie name to search."
 )
 
@@ -642,13 +1040,25 @@ HELP_TEXT = (
     "🎲 <b>Random Movie</b> — get a surprise pick\n"
     "🔥 <b>Trending</b> — what's popular this week\n"
     "⭐ <b>Top Rated</b> — all-time highest rated\n"
-    "❤️ <b>Favorites</b> — movies you've saved\n\n"
+    "🆕 <b>Now Playing</b> — currently in theaters\n"
+    "📅 <b>Upcoming</b> — coming soon\n"
+    "📺 <b>TV Shows</b> — popular series\n"
+    "🎌 <b>Anime</b> — Japanese animation\n"
+    "🎭 <b>Genres</b> — browse by genre\n"
+    "🎬 <b>Collections</b> — Marvel, Pixar, Ghibli, Nolan\n"
+    "🔍 <b>Person Search</b> — actors & directors\n"
+    "❤️ <b>Favorites</b> — movies you've saved\n"
+    "📋 <b>Watchlist</b> — movies to watch later\n"
+    "⭐ <b>Rate</b> — rate any movie 1–10\n"
+    "📜 <b>History</b> — your recent searches\n"
+    "⚙️ <b>Settings</b> — daily recommendations toggle\n"
+    "🧠 <b>AI Recommend</b> — smart suggestions via Gemini\n\n"
     "You can also just type any movie title to search for it directly."
 )
 
 
 # =========================================================================
-# 8. HANDLERS
+# 10. HANDLERS
 # =========================================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -670,7 +1080,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only: quick usage stats."""
     config: Config = context.bot_data["config"]
     user = update.effective_user
     if user is None or config.admin_id is None or user.id != config.admin_id:
@@ -681,10 +1090,52 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"👥 Total users: {db.user_count()}")
 
 
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    user = update.effective_user
+    if user is None or config.admin_id is None or user.id != config.admin_id:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    context.user_data["awaiting_broadcast"] = True
+    await update.message.reply_text(
+        "📢 Send the message you want to broadcast to all users.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]]),
+    )
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    telegram_id = update.effective_user.id
+    settings = db.get_user_settings(telegram_id)
+    await update.message.reply_text(
+        "⚙️ <b>Settings</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+    )
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    telegram_id = update.effective_user.id
+    history = db.get_search_history(telegram_id, limit=10)
+    if not history:
+        await update.message.reply_text(
+            "📜 No search history yet.", reply_markup=back_to_menu_keyboard()
+        )
+        return
+    lines = [f"• {row['query']} — <i>{row['searched_at']}</i>" for row in history]
+    await update.message.reply_text(
+        "📜 <b>Recent Searches:</b>\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
+# --- Shared send helpers ---
+
 async def _send_movie(
     update_or_query, context: ContextTypes.DEFAULT_TYPE, movie: dict[str, Any], telegram_id: int
 ) -> None:
-    """Shared logic to render a movie card, used by several handlers."""
     tmdb: TMDbClient = context.bot_data["tmdb"]
     db: Database = context.bot_data["db"]
 
@@ -692,18 +1143,21 @@ async def _send_movie(
         details = tmdb.get_movie_details(movie["id"])
     except TMDbError as exc:
         log.error("Failed to fetch movie details for id=%s: %s", movie.get("id"), exc)
-        details = movie  # fall back to the lighter object we already have
+        details = movie
 
-    caption = format_movie_caption(details)
+    user_rating = db.get_rating(telegram_id, details["id"])
+    caption = format_movie_caption(details, user_rating=user_rating)
     trailer_url = get_youtube_trailer(details)
     keyboard = movie_actions_keyboard(
-        details["id"], db.is_favorite(telegram_id, details["id"]), trailer_url=trailer_url
+        details["id"],
+        db.is_favorite(telegram_id, details["id"]),
+        db.is_watchlist(telegram_id, details["id"]),
+        user_rating,
+        trailer_url=trailer_url,
     )
     image = poster_url(details)
 
-    send_photo = getattr(update_or_query, "message", update_or_query)
     chat = update_or_query.effective_chat if hasattr(update_or_query, "effective_chat") else None
-
     target_chat_id = chat.id if chat else update_or_query.message.chat_id
 
     if image:
@@ -731,7 +1185,6 @@ async def _send_tv_or_anime(
     refresh_action: str,
     refresh_label: str,
 ) -> None:
-    """Shared logic to render a TV/anime card (not tracked in favorites)."""
     tmdb: TMDbClient = context.bot_data["tmdb"]
 
     try:
@@ -763,6 +1216,32 @@ async def _send_tv_or_anime(
             reply_markup=keyboard,
         )
 
+
+async def _send_person(update_or_query, context: ContextTypes.DEFAULT_TYPE, person: dict[str, Any]) -> None:
+    caption = format_person_caption(person)
+    image = poster_url(person)
+
+    chat = update_or_query.effective_chat if hasattr(update_or_query, "effective_chat") else None
+    target_chat_id = chat.id if chat else update_or_query.message.chat_id
+
+    if image:
+        await context.bot.send_photo(
+            chat_id=target_chat_id,
+            photo=image,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+
+
+# --- Menu button handler ---
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -833,12 +1312,10 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not movies:
                 await query.message.reply_text("😕 No trending movies found right now.")
                 return
-            lines = [f"{i}. {m.get('title', 'Untitled')}" for i, m in enumerate(movies, 1)]
             await query.message.reply_text(
-                "🔥 <b>Trending this week:</b>\n\n" + "\n".join(lines)
-                + "\n\nType a title above to see full details.",
+                "🔥 <b>Trending this week:</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=back_to_menu_keyboard(),
+                reply_markup=search_results_keyboard(movies, prefix="view"),
             )
 
         elif action == "top_rated":
@@ -846,33 +1323,110 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not movies:
                 await query.message.reply_text("😕 No top rated movies found right now.")
                 return
-            lines = [f"{i}. {m.get('title', 'Untitled')} — ⭐{m.get('vote_average', 0):.1f}" for i, m in enumerate(movies, 1)]
             await query.message.reply_text(
-                "⭐ <b>Top Rated:</b>\n\n" + "\n".join(lines)
-                + "\n\nType a title above to see full details.",
+                "⭐ <b>Top Rated:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_results_keyboard(movies, prefix="view"),
+            )
+
+        elif action == "now_playing":
+            movies = tmdb.get_now_playing()[:8]
+            if not movies:
+                await query.message.reply_text("😕 No now playing movies found.")
+                return
+            await query.message.reply_text(
+                "🆕 <b>Now Playing in Theaters:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_results_keyboard(movies, prefix="view"),
+            )
+
+        elif action == "upcoming":
+            movies = tmdb.get_upcoming()[:8]
+            if not movies:
+                await query.message.reply_text("😕 No upcoming movies found.")
+                return
+            await query.message.reply_text(
+                "📅 <b>Upcoming Movies:</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_results_keyboard(movies, prefix="view"),
+            )
+
+        elif action == "favorites":
+            context.user_data["list_type"] = "favorites"
+            context.user_data["list_page"] = 0
+            await _show_paginated_list(query, context, telegram_id)
+
+        elif action == "watchlist":
+            context.user_data["list_type"] = "watchlist"
+            context.user_data["list_page"] = 0
+            await _show_paginated_list(query, context, telegram_id)
+
+        elif action == "history":
+            history = db.get_search_history(telegram_id, limit=10)
+            if not history:
+                await query.message.reply_text(
+                    "📜 No search history yet.", reply_markup=back_to_menu_keyboard()
+                )
+                return
+            lines = [f"• {row['query']} — <i>{row['searched_at']}</i>" for row in history]
+            await query.message.reply_text(
+                "📜 <b>Recent Searches:</b>\n\n" + "\n".join(lines),
                 parse_mode=ParseMode.HTML,
                 reply_markup=back_to_menu_keyboard(),
             )
 
-        elif action == "favorites":
-            favorites = db.list_favorites(telegram_id)
-            if not favorites:
-                await query.message.reply_text(
-                    "❤️ You have no favorites yet. Find a movie and tap 'Add Favorite'!",
-                    reply_markup=back_to_menu_keyboard(),
-                )
-                return
-            lines = [f"• {row['title']}" for row in favorites]
+        elif action == "settings":
+            settings = db.get_user_settings(telegram_id)
             await query.message.reply_text(
-                "❤️ <b>Your Favorites:</b>\n\n" + "\n".join(lines),
+                "⚙️ <b>Settings</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=back_to_menu_keyboard(),
+                reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+            )
+
+        elif action == "person":
+            context.user_data["awaiting_person_search"] = True
+            await query.message.reply_text(
+                "🔍 نام بازیگر یا کارگردان را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]]),
             )
 
     except TMDbError as exc:
         log.error("TMDb error in menu action '%s': %s", action, exc)
         await query.message.reply_text("⚠️ Movie service is temporarily unavailable. Please try again shortly.")
 
+
+async def _show_paginated_list(query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
+    db: Database = context.bot_data["db"]
+    list_type = context.user_data.get("list_type", "favorites")
+    page = context.user_data.get("list_page", 0)
+
+    if list_type == "favorites":
+        total = db.count_favorites(telegram_id)
+        items = db.list_favorites(telegram_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
+        header = "❤️ <b>Your Favorites:</b>"
+    else:
+        total = db.count_watchlist(telegram_id)
+        items = db.list_watchlist(telegram_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
+        header = "📋 <b>Your Watchlist:</b>"
+
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    if not items:
+        await query.message.reply_text(
+            f"{'❤️' if list_type == 'favorites' else '📋'} Your {list_type} is empty.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    lines = [f"• {row['title']}" for row in items]
+    await query.message.reply_text(
+        f"{header}\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=list_pagination_keyboard(page, total_pages, list_type),
+    )
+
+
+# --- Favorite / Watchlist / Rating handlers ---
 
 async def on_favorite_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -897,6 +1451,59 @@ async def on_favorite_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Removed from favorites 💔", show_alert=False)
 
 
+async def on_watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    db: Database = context.bot_data["db"]
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    action, movie_id_str = query.data.split(":", 1)
+    movie_id = int(movie_id_str)
+
+    if action == "wl":
+        try:
+            details = tmdb.get_movie_details(movie_id)
+            title = details.get("title", "Unknown")
+        except TMDbError:
+            title = "Unknown"
+        added = db.add_watchlist(telegram_id, movie_id, title)
+        await query.answer("Added to watchlist 📋" if added else "Already in watchlist", show_alert=False)
+    elif action == "unwl":
+        db.remove_watchlist(telegram_id, movie_id)
+        await query.answer("Removed from watchlist ➖", show_alert=False)
+
+
+async def on_rating_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":", 1)[1])
+    await query.message.reply_text(
+        "⭐ امتیاز خود را انتخاب کنید:",
+        reply_markup=rating_keyboard(movie_id),
+    )
+
+
+async def on_rating_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    db: Database = context.bot_data["db"]
+    telegram_id = query.from_user.id
+
+    _, movie_id_str, rating_str = query.data.split(":")
+    movie_id = int(movie_id_str)
+    rating = int(rating_str)
+
+    db.add_rating(telegram_id, movie_id, rating)
+    await query.answer(f"Rated {rating}/10 ⭐", show_alert=False)
+    await query.message.reply_text(
+        f"✅ امتیاز {rating}/10 ثبت شد.",
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
+# --- Similar / Recommendations / Reviews ---
+
 async def on_similar_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -915,8 +1522,65 @@ async def on_similar_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text("😕 مورد مشابهی پیدا نشد.")
         return
 
-    await _send_movie(query, context, similar[0], telegram_id)
+    await query.message.reply_text(
+        "👍 <b>Similar Movies:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=search_results_keyboard(similar[:6], prefix="view"),
+    )
 
+
+async def on_recommendation_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        recs = tmdb.get_movie_recommendations(movie_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch recommendations for id=%s: %s", movie_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    if not recs:
+        await query.message.reply_text("😕 پیشنهادی پیدا نشد.")
+        return
+
+    await query.message.reply_text(
+        "🎯 <b>Recommended for you:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=search_results_keyboard(recs[:6], prefix="view"),
+    )
+
+
+async def on_reviews_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        reviews = tmdb.get_movie_reviews(movie_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch reviews for id=%s: %s", movie_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    if not reviews:
+        await query.message.reply_text("😕 نقدی برای این فیلم پیدا نشد.")
+        return
+
+    review = reviews[0]
+    text = format_review(review)
+    await query.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
+# --- Genre / Collection / View / Person / Page ---
 
 async def on_genre_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -963,9 +1627,75 @@ async def on_collection_button(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_movie(query, context, movie, telegram_id)
 
 
+async def on_view_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        movie = tmdb.get_movie_details(movie_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch movie details for view id=%s: %s", movie_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    await _send_movie(query, context, movie, telegram_id)
+
+
+async def on_person_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    person_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        person = tmdb.get_person_details(person_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch person details for id=%s: %s", person_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    await _send_person(query, context, person)
+
+
+async def on_page_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, list_type, page_str = query.data.split(":")
+    page = int(page_str)
+    context.user_data["list_type"] = list_type
+    context.user_data["list_page"] = page
+    await _show_paginated_list(query, context, query.from_user.id)
+
+
+async def on_settings_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    db: Database = context.bot_data["db"]
+    telegram_id = query.from_user.id
+    action = query.data.split(":", 1)[1]
+
+    if action == "daily":
+        settings = db.get_user_settings(telegram_id)
+        new_val = 0 if settings["daily_recommendation"] else 1
+        db.update_user_settings(telegram_id, daily_recommendation=new_val)
+        settings = db.get_user_settings(telegram_id)
+        await query.message.reply_text(
+            "⚙️ <b>Settings updated.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+        )
+    elif action == "history":
+        db.clear_search_history(telegram_id)
+        await query.answer("History cleared 🗑", show_alert=False)
+        await query.message.reply_text("📜 تاریخچه جستجو پاک شد.", reply_markup=back_to_menu_keyboard())
+
+
+# --- Text search handler ---
+
 async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treats any plain text message as a movie title search, unless the
-    user is mid-conversation answering the smart-recommendation prompt."""
     if update.message is None or not update.message.text:
         return
 
@@ -975,7 +1705,32 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     telegram_id = update.effective_user.id
     tmdb: TMDbClient = context.bot_data["tmdb"]
+    db: Database = context.bot_data["db"]
 
+    # Handle admin broadcast
+    if context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        config: Config = context.bot_data["config"]
+        if config.admin_id is None or telegram_id != config.admin_id:
+            await update.message.reply_text("⛔ Admin only.")
+            return
+        all_users = db.get_all_user_ids()
+        sent = 0
+        failed = 0
+        for uid in all_users:
+            try:
+                await context.bot.send_message(chat_id=uid, text=query_text, parse_mode=ParseMode.HTML)
+                sent += 1
+            except Exception as exc:
+                log.warning("Broadcast failed for user %s: %s", uid, exc)
+                failed += 1
+        await update.message.reply_text(
+            f"📢 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    # Handle AI recommendation
     if context.user_data.get("awaiting_ai_recommendation"):
         context.user_data["awaiting_ai_recommendation"] = False
         gemini: Optional[GeminiClient] = context.bot_data.get("gemini")
@@ -997,95 +1752,3 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if not results:
-            await update.message.reply_text(
-                f"😕 برای پیشنهاد «{suggested_title}» چیزی روی TMDb پیدا نشد.",
-                reply_markup=back_to_menu_keyboard(),
-            )
-            return
-
-        await update.message.reply_text(
-            f"🧠 <b>پیشنهاد هوشمند:</b> {suggested_title}", parse_mode=ParseMode.HTML
-        )
-        await _send_movie(update, context, results[0], telegram_id)
-        return
-
-    try:
-        results = tmdb.search_movies(query_text)
-    except TMDbError as exc:
-        log.error("TMDb search failed for query='%s': %s", query_text, exc)
-        await update.message.reply_text("⚠️ Search is temporarily unavailable. Please try again shortly.")
-        return
-
-    if not results:
-        await update.message.reply_text(
-            f"😕 No results found for \"{query_text}\". Try a different title.",
-            reply_markup=back_to_menu_keyboard(),
-        )
-        return
-
-    await _send_movie(update, context, results[0], telegram_id)
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler: logs everything so the bot never dies silently."""
-    log.error("Unhandled exception while processing update: %s", context.error, exc_info=context.error)
-
-
-# =========================================================================
-# 9. APPLICATION BOOTSTRAP
-# =========================================================================
-
-def build_application(config: Config) -> Application:
-    # Generous timeouts: connections routed through a VPN/proxy can be slow
-    # rather than truly blocked, so we give them much more room than the
-    # library's default ~5s before giving up.
-    application = (
-        Application.builder()
-        .token(config.bot_token)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .get_updates_connect_timeout(30)
-        .get_updates_read_timeout(30)
-        .get_updates_write_timeout(30)
-        .get_updates_pool_timeout(30)
-        .build()
-    )
-
-    # Shared services, accessible in every handler via context.bot_data
-    application.bot_data["config"] = config
-    application.bot_data["db"] = Database(DB_PATH)
-    application.bot_data["tmdb"] = TMDbClient(config.tmdb_api_key)
-    application.bot_data["gemini"] = (
-        GeminiClient(config.gemini_api_key) if config.gemini_api_key else None
-    )
-
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("stats", cmd_stats))
-    application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
-    application.add_handler(CallbackQueryHandler(on_favorite_button, pattern=r"^(fav|unfav):"))
-    application.add_handler(CallbackQueryHandler(on_similar_button, pattern=r"^similar:"))
-    application.add_handler(CallbackQueryHandler(on_genre_button, pattern=r"^genre:"))
-    application.add_handler(CallbackQueryHandler(on_collection_button, pattern=r"^collection:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_search))
-    application.add_error_handler(on_error)
-
-    return application
-
-
-def main() -> None:
-    try:
-        config = Config.load()
-    except RuntimeError as exc:
-        log.critical("Startup failed: %s", exc)
-        sys.exit(1)
-
-    log.info("Starting MovieBot...")
-    application = build_application(config)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
