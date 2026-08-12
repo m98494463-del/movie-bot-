@@ -10,7 +10,7 @@ simple SQLite-backed favorites list.
 SETUP
 --------------------------------------------------------------
 1) Install dependencies:
-     pip install python-telegram-bot==21.* python-dotenv requests
+     pip install python-telegram-bot==22.* python-dotenv requests
 
 2) Create a ".env" file next to this script with:
      BOT_TOKEN=your_telegram_bot_token
@@ -334,8 +334,12 @@ class TMDbClient:
         return data.get("results", [])
 
     def get_movie_details(self, movie_id: int) -> dict[str, Any]:
-        details = self._get(f"/movie/{movie_id}")
+        details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos"})
         return self._with_overview_fallback(f"/movie/{movie_id}", details)
+
+    def get_similar_movies(self, movie_id: int) -> list[dict[str, Any]]:
+        data = self._get(f"/movie/{movie_id}/similar", params={"language": "en-US"})
+        return data.get("results", [])
 
     def get_tv_trending(self) -> list[dict[str, Any]]:
         data = self._get("/trending/tv/week")
@@ -348,7 +352,7 @@ class TMDbClient:
         return random.choice(results) if results else None
 
     def get_tv_details(self, tv_id: int) -> dict[str, Any]:
-        details = self._get(f"/tv/{tv_id}")
+        details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos"})
         return self._with_overview_fallback(f"/tv/{tv_id}", details)
 
     def get_random_anime(self) -> Optional[dict[str, Any]]:
@@ -367,6 +371,24 @@ class TMDbClient:
         )
         results = data.get("results", [])
         return random.choice(results) if results else None
+
+    def _discover_random(self, **extra_params: str) -> Optional[dict[str, Any]]:
+        page = random.randint(1, 5)
+        params = dict(extra_params)
+        params["page"] = str(page)
+        params.setdefault("sort_by", "popularity.desc")
+        data = self._get("/discover/movie", params=params)
+        results = data.get("results", [])
+        return random.choice(results) if results else None
+
+    def get_random_by_genre(self, genre_id: str) -> Optional[dict[str, Any]]:
+        return self._discover_random(with_genres=genre_id)
+
+    def get_random_by_company(self, company_id: str) -> Optional[dict[str, Any]]:
+        return self._discover_random(with_companies=company_id)
+
+    def get_random_by_crew(self, person_id: str) -> Optional[dict[str, Any]]:
+        return self._discover_random(with_crew=person_id)
 
 
 # =========================================================================
@@ -481,9 +503,40 @@ def poster_url(movie: dict[str, Any]) -> Optional[str]:
     return f"{TMDB_IMAGE_BASE}{path}" if path else None
 
 
+def get_youtube_trailer(item: dict[str, Any]) -> Optional[str]:
+    videos = (item.get("videos") or {}).get("results", [])
+    for video in videos:
+        if video.get("site") == "YouTube" and video.get("type") in ("Trailer", "Teaser"):
+            return f"https://www.youtube.com/watch?v={video.get('key')}"
+    return None
+
+
 # =========================================================================
 # 6. KEYBOARDS
 # =========================================================================
+
+GENRES: list[tuple[str, str]] = [
+    ("28", "🎬 اکشن"),
+    ("35", "😂 کمدی"),
+    ("27", "👻 ترسناک"),
+    ("10749", "❤️ عاشقانه"),
+    ("878", "🚀 علمی-تخیلی"),
+    ("16", "🎨 انیمیشن"),
+    ("18", "🎭 درام"),
+    ("53", "🔪 هیجانی"),
+    ("12", "🗺 ماجراجویی"),
+    ("80", "🕵️ جنایی"),
+]
+
+# (discover kind, TMDb id, label). kind "company" filters by studio,
+# "crew" filters by a person's crew credits (e.g. director).
+COLLECTIONS: list[tuple[str, str, str]] = [
+    ("company", "420", "🦸 مارول"),
+    ("company", "3", "🧸 پیکسار"),
+    ("company", "10342", "🎨 استودیو جیبلی"),
+    ("crew", "525", "🎬 کریستوفر نولان"),
+]
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
@@ -493,10 +546,37 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⭐ Top Rated", callback_data="menu:top_rated")],
         [InlineKeyboardButton("📺 سریال محبوب", callback_data="menu:tv")],
         [InlineKeyboardButton("🎌 انیمه", callback_data="menu:anime")],
+        [InlineKeyboardButton("🎭 ژانرها", callback_data="menu:genres")],
+        [InlineKeyboardButton("🎬 مجموعه‌ها", callback_data="menu:collections")],
         [InlineKeyboardButton("❤️ Favorites", callback_data="menu:favorites")],
         [InlineKeyboardButton("❓ Help", callback_data="menu:help")],
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def genres_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(GENRES), 2):
+        pair = GENRES[i : i + 2]
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"genre:{gid}") for gid, label in pair]
+        )
+    rows.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def collections_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(COLLECTIONS), 2):
+        pair = COLLECTIONS[i : i + 2]
+        rows.append(
+            [
+                InlineKeyboardButton(label, callback_data=f"collection:{kind}:{cid}")
+                for kind, cid, label in pair
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
 
 
 def simple_actions_keyboard(refresh_action: str, refresh_label: str) -> InlineKeyboardMarkup:
@@ -508,15 +588,26 @@ def simple_actions_keyboard(refresh_action: str, refresh_label: str) -> InlineKe
     return InlineKeyboardMarkup(buttons)
 
 
-def movie_actions_keyboard(movie_id: int, is_favorite: bool) -> InlineKeyboardMarkup:
+def movie_actions_keyboard(
+    movie_id: int,
+    is_favorite: bool,
+    refresh_callback: str = "menu:random",
+    refresh_label: str = "🎲 Another Random",
+    trailer_url: Optional[str] = None,
+) -> InlineKeyboardMarkup:
     fav_button = (
         InlineKeyboardButton("💔 Remove Favorite", callback_data=f"unfav:{movie_id}")
         if is_favorite
         else InlineKeyboardButton("❤️ Add Favorite", callback_data=f"fav:{movie_id}")
     )
+    top_row = [fav_button]
+    if trailer_url:
+        top_row.append(InlineKeyboardButton("🎬 تریلر", url=trailer_url))
+
     buttons = [
-        [fav_button],
-        [InlineKeyboardButton("🎲 Another Random", callback_data="menu:random")],
+        top_row,
+        [InlineKeyboardButton("👍 موارد مشابه", callback_data=f"similar:{movie_id}")],
+        [InlineKeyboardButton(refresh_label, callback_data=refresh_callback)],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -604,7 +695,10 @@ async def _send_movie(
         details = movie  # fall back to the lighter object we already have
 
     caption = format_movie_caption(details)
-    keyboard = movie_actions_keyboard(details["id"], db.is_favorite(telegram_id, details["id"]))
+    trailer_url = get_youtube_trailer(details)
+    keyboard = movie_actions_keyboard(
+        details["id"], db.is_favorite(telegram_id, details["id"]), trailer_url=trailer_url
+    )
     image = poster_url(details)
 
     send_photo = getattr(update_or_query, "message", update_or_query)
@@ -728,6 +822,12 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 query, context, anime, "anime", refresh_action="anime", refresh_label="🔄 انیمه دیگر"
             )
 
+        elif action == "genres":
+            await query.message.reply_text("🎭 یک ژانر انتخاب کن:", reply_markup=genres_keyboard())
+
+        elif action == "collections":
+            await query.message.reply_text("🎬 یک مجموعه انتخاب کن:", reply_markup=collections_keyboard())
+
         elif action == "trending":
             movies = tmdb.get_trending()[:8]
             if not movies:
@@ -795,6 +895,72 @@ async def on_favorite_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "unfav":
         db.remove_favorite(telegram_id, movie_id)
         await query.answer("Removed from favorites 💔", show_alert=False)
+
+
+async def on_similar_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    movie_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        similar = tmdb.get_similar_movies(movie_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch similar movies for id=%s: %s", movie_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    if not similar:
+        await query.message.reply_text("😕 مورد مشابهی پیدا نشد.")
+        return
+
+    await _send_movie(query, context, similar[0], telegram_id)
+
+
+async def on_genre_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    genre_id = query.data.split(":", 1)[1]
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        movie = tmdb.get_random_by_genre(genre_id)
+    except TMDbError as exc:
+        log.error("TMDb genre discover failed for genre=%s: %s", genre_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    if movie is None:
+        await query.message.reply_text("😕 فیلمی در این ژانر پیدا نشد.")
+        return
+
+    await _send_movie(query, context, movie, telegram_id)
+
+
+async def on_collection_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, kind, collection_id = query.data.split(":", 2)
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        if kind == "company":
+            movie = tmdb.get_random_by_company(collection_id)
+        else:
+            movie = tmdb.get_random_by_crew(collection_id)
+    except TMDbError as exc:
+        log.error("TMDb collection discover failed for %s=%s: %s", kind, collection_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    if movie is None:
+        await query.message.reply_text("😕 فیلمی در این مجموعه پیدا نشد.")
+        return
+
+    await _send_movie(query, context, movie, telegram_id)
 
 
 async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -900,6 +1066,9 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
     application.add_handler(CallbackQueryHandler(on_favorite_button, pattern=r"^(fav|unfav):"))
+    application.add_handler(CallbackQueryHandler(on_similar_button, pattern=r"^similar:"))
+    application.add_handler(CallbackQueryHandler(on_genre_button, pattern=r"^genre:"))
+    application.add_handler(CallbackQueryHandler(on_collection_button, pattern=r"^collection:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_search))
     application.add_error_handler(on_error)
 
