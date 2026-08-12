@@ -12,7 +12,7 @@ person search, reviews, and user settings.
 SETUP
 --------------------------------------------------------------
 1) Install dependencies:
-     pip install python-telegram-bot==22.* python-dotenv requests
+     pip install "python-telegram-bot[job-queue]==21.*" python-dotenv requests
 
 2) Create a ".env" file next to this script with:
      BOT_TOKEN=your_telegram_bot_token
@@ -567,7 +567,7 @@ class TMDbClient:
         return random.choice(results) if results else None
 
     def get_tv_details(self, tv_id: int) -> dict[str, Any]:
-        details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos"})
+        details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos,credits"})
         return self._with_overview_fallback(f"/tv/{tv_id}", details)
 
     def search_tv(self, query: str) -> list[dict[str, Any]]:
@@ -663,16 +663,16 @@ class GeminiClient:
 # 7. FORMATTING HELPERS
 # =========================================================================
 
-def _extract_director(crew: list[dict]) -> str:
+def _extract_director(crew: list[dict]) -> Optional[str]:
     for person in crew:
         if person.get("job") == "Director":
-            return person.get("name", "Unknown")
-    return "Unknown"
+            return person.get("name")
+    return None
 
 
-def _extract_top_cast(cast: list[dict], limit: int = 3) -> str:
+def _extract_top_cast(cast: list[dict], limit: int = 3) -> Optional[str]:
     names = [p.get("name", "") for p in cast[:limit] if p.get("name")]
-    return ", ".join(names) if names else "N/A"
+    return ", ".join(names) if names else None
 
 
 def format_movie_caption(
@@ -726,10 +726,16 @@ def format_movie_caption(
             runtime_str = f"{hours}h {mins}m" if hours else f"{mins}m"
             runtime_line = f"⏱ <b>مدت زمان:</b> {runtime_str}\n"
 
-    credits = item.get("credits", {})
+    # Only show director/cast if we actually fetched credits for this item —
+    # otherwise this silently prints "Unknown" / nothing on every card.
+    credits = item.get("credits") or {}
     director = _extract_director(credits.get("crew", []))
     top_cast = _extract_top_cast(credits.get("cast", []))
-    crew_line = f"🎬 <b>کارگردان:</b> {director}\n🎭 <b>بازیگران:</b> {top_cast}\n"
+    crew_line = ""
+    if director:
+        crew_line += f"🎬 <b>کارگردان:</b> {director}\n"
+    if top_cast:
+        crew_line += f"🎭 <b>بازیگران:</b> {top_cast}\n"
 
     budget = item.get("budget")
     revenue = item.get("revenue")
@@ -919,9 +925,12 @@ def movie_actions_keyboard(
     wl_label = "➖ Remove Watchlist" if is_watchlist else "📋 Add Watchlist"
     rate_label = f"⭐ Rate ({user_rating}/10)" if user_rating else "⭐ Rate"
 
+    fav_callback = f"unfav:{movie_id}" if is_favorite else f"fav:{movie_id}"
+    wl_callback = f"unwl:{movie_id}" if is_watchlist else f"wl:{movie_id}"
+
     top_row = [
-        InlineKeyboardButton(fav_label, callback_data=f"fav:{movie_id}"),
-        InlineKeyboardButton(wl_label, callback_data=f"wl:{movie_id}"),
+        InlineKeyboardButton(fav_label, callback_data=fav_callback),
+        InlineKeyboardButton(wl_label, callback_data=wl_callback),
     ]
     second_row = [
         InlineKeyboardButton(rate_label, callback_data=f"ratemenu:{movie_id}"),
@@ -1509,7 +1518,6 @@ async def on_similar_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     movie_id = int(query.data.split(":", 1)[1])
     tmdb: TMDbClient = context.bot_data["tmdb"]
-    telegram_id = query.from_user.id
 
     try:
         similar = tmdb.get_similar_movies(movie_id)
@@ -1534,7 +1542,6 @@ async def on_recommendation_button(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     movie_id = int(query.data.split(":", 1)[1])
     tmdb: TMDbClient = context.bot_data["tmdb"]
-    telegram_id = query.from_user.id
 
     try:
         recs = tmdb.get_movie_recommendations(movie_id)
@@ -1668,6 +1675,12 @@ async def on_page_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data["list_type"] = list_type
     context.user_data["list_page"] = page
     await _show_paginated_list(query, context, query.from_user.id)
+
+
+async def on_noop_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # The page-indicator button in list_pagination_keyboard isn't meant to
+    # do anything — just clear the loading spinner Telegram shows on tap.
+    await update.callback_query.answer()
 
 
 async def on_settings_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1950,6 +1963,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CallbackQueryHandler(on_view_button, pattern=r"^view:"))
     application.add_handler(CallbackQueryHandler(on_person_button, pattern=r"^person:"))
     application.add_handler(CallbackQueryHandler(on_page_button, pattern=r"^page:"))
+    application.add_handler(CallbackQueryHandler(on_noop_button, pattern=r"^noop$"))
     application.add_handler(CallbackQueryHandler(on_settings_toggle, pattern=r"^(toggle|clear):"))
 
     # Inline
@@ -1961,7 +1975,8 @@ def build_application(config: Config) -> Application:
     # Errors
     application.add_error_handler(on_error)
 
-    # Jobs
+    # Jobs (only if the job-queue extra / APScheduler is installed; otherwise
+    # this is silently skipped instead of crashing at startup)
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(
@@ -1969,6 +1984,11 @@ def build_application(config: Config) -> Application:
             interval=86400,
             first=3600,
             name="daily_recommendation",
+        )
+    else:
+        log.warning(
+            "JobQueue not available (install python-telegram-bot[job-queue] "
+            "to enable it) — daily recommendations are disabled."
         )
 
     return application
