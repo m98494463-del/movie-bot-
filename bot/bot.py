@@ -1,18 +1,20 @@
 """
-Telegram Movie Recommendation Bot — Full Edition
-=================================================
+Telegram Movie Recommendation Bot — Ultimate Edition
+=====================================================
 
 A production-ready single-file Telegram bot for movie discovery via TMDb.
-Features: random picks, search, trending, top-rated, now playing, upcoming,
-genres, collections, TV shows, anime, favorites, watchlist, ratings, search
-history, inline mode, AI recommendations, daily jobs, admin broadcast,
-person search, reviews, and user settings.
+Features: random picks, search (paginated), trending (movie/tv), top-rated,
+now playing, upcoming, airing today, on the air, genres, collections,
+TV shows, anime, favorites, watchlist, ratings, search history, inline mode,
+AI recommendations, daily jobs, admin broadcast, person search, reviews,
+watch providers, IMDb links, keywords, certifications, backdrops, share,
+user stats, data export, advanced discover, and user settings.
 
 --------------------------------------------------------------
 SETUP
 --------------------------------------------------------------
 1) Install dependencies:
-     pip install "python-telegram-bot[job-queue]==21.*" python-dotenv requests
+     pip install python-telegram-bot==22.* python-dotenv requests
 
 2) Create a ".env" file next to this script with:
      BOT_TOKEN=your_telegram_bot_token
@@ -26,6 +28,8 @@ SETUP
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import os
 import random
@@ -72,7 +76,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "movie_bot.db"
 LOG_PATH = LOGS_DIR / "bot.log"
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 
 @dataclass(frozen=True)
@@ -367,6 +371,22 @@ class Database:
             ).fetchone()
             return int(row["rating"]) if row else None
 
+    def get_user_avg_rating(self, telegram_id: int) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT AVG(rating) AS avg FROM ratings WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            return float(row["avg"]) if row and row["avg"] else None
+
+    def get_user_rating_count(self, telegram_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM ratings WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            return int(row["c"])
+
     # --- Search History ---
     def add_search_history(self, telegram_id: int, query: str) -> None:
         with self._connect() as conn:
@@ -471,6 +491,7 @@ class SimpleCache:
 
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+TMDB_BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
 
@@ -524,8 +545,8 @@ class TMDbClient:
         return details
 
     # --- Movies ---
-    def get_trending(self) -> list[dict[str, Any]]:
-        return self._get("/trending/movie/week").get("results", [])
+    def get_trending(self, media_type: str = "movie", time_window: str = "week") -> list[dict[str, Any]]:
+        return self._get(f"/trending/{media_type}/{time_window}").get("results", [])
 
     def get_top_rated(self) -> list[dict[str, Any]]:
         return self._get("/movie/top_rated").get("results", [])
@@ -536,17 +557,23 @@ class TMDbClient:
     def get_upcoming(self) -> list[dict[str, Any]]:
         return self._get("/movie/upcoming").get("results", [])
 
+    def get_popular(self, page: int = 1) -> list[dict[str, Any]]:
+        return self._get("/movie/popular", params={"page": page}).get("results", [])
+
     def get_random_movie(self) -> Optional[dict[str, Any]]:
         page = random.randint(1, 20)
         results = self._get("/movie/popular", params={"page": page}).get("results", [])
         return random.choice(results) if results else None
 
-    def search_movies(self, query: str) -> list[dict[str, Any]]:
-        return self._get("/search/movie", params={"query": query}).get("results", [])
+    def search_movies(self, query: str, page: int = 1) -> dict[str, Any]:
+        return self._get("/search/movie", params={"query": query, "page": page})
 
     def get_movie_details(self, movie_id: int) -> dict[str, Any]:
-        details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos,credits"})
+        details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos,credits,keywords,release_dates,external_ids"})
         return self._with_overview_fallback(f"/movie/{movie_id}", details)
+
+    def get_movie_providers(self, movie_id: int) -> dict[str, Any]:
+        return self._get(f"/movie/{movie_id}/watch/providers").get("results", {})
 
     def get_similar_movies(self, movie_id: int) -> list[dict[str, Any]]:
         return self._get(f"/movie/{movie_id}/similar", params={"language": "en-US"}).get("results", [])
@@ -558,8 +585,14 @@ class TMDbClient:
         return self._get(f"/movie/{movie_id}/reviews").get("results", [])
 
     # --- TV ---
-    def get_tv_trending(self) -> list[dict[str, Any]]:
-        return self._get("/trending/tv/week").get("results", [])
+    def get_tv_trending(self, time_window: str = "week") -> list[dict[str, Any]]:
+        return self._get(f"/trending/tv/{time_window}").get("results", [])
+
+    def get_tv_airing_today(self) -> list[dict[str, Any]]:
+        return self._get("/tv/airing_today").get("results", [])
+
+    def get_tv_on_the_air(self) -> list[dict[str, Any]]:
+        return self._get("/tv/on_the_air").get("results", [])
 
     def get_random_tv(self) -> Optional[dict[str, Any]]:
         page = random.randint(1, 20)
@@ -567,18 +600,24 @@ class TMDbClient:
         return random.choice(results) if results else None
 
     def get_tv_details(self, tv_id: int) -> dict[str, Any]:
-        details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos,credits"})
+        details = self._get(f"/tv/{tv_id}", params={"append_to_response": "videos,external_ids"})
         return self._with_overview_fallback(f"/tv/{tv_id}", details)
 
-    def search_tv(self, query: str) -> list[dict[str, Any]]:
-        return self._get("/search/tv", params={"query": query}).get("results", [])
+    def get_tv_season(self, tv_id: int, season_num: int) -> dict[str, Any]:
+        return self._get(f"/tv/{tv_id}/season/{season_num}")
+
+    def search_tv(self, query: str, page: int = 1) -> dict[str, Any]:
+        return self._get("/search/tv", params={"query": query, "page": page})
 
     # --- People ---
-    def search_person(self, query: str) -> list[dict[str, Any]]:
-        return self._get("/search/person", params={"query": query}).get("results", [])
+    def search_person(self, query: str, page: int = 1) -> dict[str, Any]:
+        return self._get("/search/person", params={"query": query, "page": page})
 
     def get_person_details(self, person_id: int) -> dict[str, Any]:
-        return self._get(f"/person/{person_id}", params={"append_to_response": "movie_credits"})
+        return self._get(f"/person/{person_id}", params={"append_to_response": "movie_credits,tv_credits,external_ids"})
+
+    def get_popular_people(self, page: int = 1) -> list[dict[str, Any]]:
+        return self._get("/person/popular", params={"page": page}).get("results", [])
 
     # --- Discover ---
     def get_random_anime(self) -> Optional[dict[str, Any]]:
@@ -593,6 +632,9 @@ class TMDbClient:
             },
         ).get("results", [])
         return random.choice(results) if results else None
+
+    def discover_movies(self, **params: Any) -> dict[str, Any]:
+        return self._get("/discover/movie", params=params)
 
     def _discover_random(self, **extra_params: str) -> Optional[dict[str, Any]]:
         page = random.randint(1, 5)
@@ -610,6 +652,12 @@ class TMDbClient:
 
     def get_random_by_crew(self, person_id: str) -> Optional[dict[str, Any]]:
         return self._discover_random(with_crew=person_id)
+
+    def get_random_by_year(self, year: str) -> Optional[dict[str, Any]]:
+        return self._discover_random(primary_release_year=year)
+
+    def get_random_by_rating(self, min_rating: str) -> Optional[dict[str, Any]]:
+        return self._discover_random(vote_average_gte=min_rating, sort_by="vote_average.desc")
 
 
 # =========================================================================
@@ -663,22 +711,68 @@ class GeminiClient:
 # 7. FORMATTING HELPERS
 # =========================================================================
 
-def _extract_director(crew: list[dict]) -> Optional[str]:
+def _extract_director(crew: list[dict]) -> str:
     for person in crew:
         if person.get("job") == "Director":
-            return person.get("name")
-    return None
+            return person.get("name", "Unknown")
+    return "Unknown"
 
 
-def _extract_top_cast(cast: list[dict], limit: int = 3) -> Optional[str]:
+def _extract_top_cast(cast: list[dict], limit: int = 3) -> str:
     names = [p.get("name", "") for p in cast[:limit] if p.get("name")]
-    return ", ".join(names) if names else None
+    return ", ".join(names) if names else "N/A"
+
+
+def _format_providers(providers: dict[str, Any], region: str = "US") -> str:
+    """Format watch providers for a given region."""
+    region_data = providers.get(region) or providers.get("US") or next(iter(providers.values()), {}) if providers else {}
+    if not region_data:
+        return ""
+    lines = []
+    for provider_type in ("flatrate", "rent", "buy"):
+        items = region_data.get(provider_type, [])
+        if items:
+            names = ", ".join(p.get("provider_name", "") for p in items[:5])
+            emoji = {"flatrate": "📺", "rent": "🎫", "buy": "💳"}.get(provider_type, "▶️")
+            label = {"flatrate": "Stream", "rent": "Rent", "buy": "Buy"}.get(provider_type, provider_type)
+            lines.append(f"{emoji} <b>{label}:</b> {names}")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def _format_certification(release_dates: list[dict], region: str = "US") -> str:
+    for rd in release_dates:
+        if rd.get("iso_3166_1") == region:
+            certs = rd.get("release_dates", [])
+            for c in certs:
+                cert = c.get("certification", "")
+                if cert:
+                    return f"🔞 <b>Rated:</b> {cert}\n"
+    return ""
+
+
+def _format_keywords(keywords: list[dict]) -> str:
+    if not keywords:
+        return ""
+    names = ", ".join(k.get("name", "") for k in keywords[:8])
+    return f"🏷 <b>Keywords:</b> {names}\n"
+
+
+def _format_external_ids(external_ids: dict[str, Any]) -> str:
+    links = []
+    imdb = external_ids.get("imdb_id")
+    if imdb:
+        links.append(f'<a href="https://www.imdb.com/title/{imdb}">🎬 IMDb</a>')
+    tmdb = external_ids.get("id")
+    if tmdb:
+        links.append(f'<a href="https://www.themoviedb.org/movie/{tmdb}">📊 TMDb</a>')
+    return " | ".join(links) + "\n" if links else ""
 
 
 def format_movie_caption(
     item: dict[str, Any],
     media_type: str = "movie",
     user_rating: Optional[int] = None,
+    providers: Optional[dict[str, Any]] = None,
 ) -> str:
     if media_type == "tv":
         title = item.get("name") or item.get("original_name") or "بدون عنوان"
@@ -718,6 +812,9 @@ def format_movie_caption(
         episodes = item.get("number_of_episodes")
         if seasons:
             runtime_line += f"📊 <b>فصل:</b> {seasons} | <b>قسمت:</b> {episodes or 'N/A'}\n"
+        status = item.get("status", "")
+        if status:
+            runtime_line += f"📡 <b>وضعیت:</b> {status}\n"
     else:
         runtime = item.get("runtime")
         if runtime:
@@ -726,16 +823,10 @@ def format_movie_caption(
             runtime_str = f"{hours}h {mins}m" if hours else f"{mins}m"
             runtime_line = f"⏱ <b>مدت زمان:</b> {runtime_str}\n"
 
-    # Only show director/cast if we actually fetched credits for this item —
-    # otherwise this silently prints "Unknown" / nothing on every card.
-    credits = item.get("credits") or {}
+    credits = item.get("credits", {})
     director = _extract_director(credits.get("crew", []))
     top_cast = _extract_top_cast(credits.get("cast", []))
-    crew_line = ""
-    if director:
-        crew_line += f"🎬 <b>کارگردان:</b> {director}\n"
-    if top_cast:
-        crew_line += f"🎭 <b>بازیگران:</b> {top_cast}\n"
+    crew_line = f"🎬 <b>کارگردان:</b> {director}\n🎭 <b>بازیگران:</b> {top_cast}\n"
 
     budget = item.get("budget")
     revenue = item.get("revenue")
@@ -751,6 +842,24 @@ def format_movie_caption(
         company_names = ", ".join(c["name"] for c in companies[:3])
         company_line = f"🏢 <b>استودیو:</b> {company_names}\n"
 
+    # Keywords & Certification
+    keywords = item.get("keywords", {}).get("keywords", [])
+    keywords_line = _format_keywords(keywords)
+
+    release_dates = item.get("release_dates", {}).get("results", [])
+    cert_line = _format_certification(release_dates)
+
+    # External links
+    external_ids = item.get("external_ids", {})
+    if not external_ids and "id" in item:
+        external_ids = {"id": item["id"]}
+    links_line = _format_external_ids(external_ids)
+
+    # Providers
+    providers_line = ""
+    if providers:
+        providers_line = _format_providers(providers)
+
     user_rating_line = ""
     if user_rating:
         stars = "⭐" * (user_rating // 2) + ("½" if user_rating % 2 else "")
@@ -763,7 +872,11 @@ def format_movie_caption(
         f"{runtime_line}"
         f"{crew_line}"
         f"{company_line}"
+        f"{cert_line}"
+        f"{keywords_line}"
         f"{money_line}"
+        f"{providers_line}"
+        f"{links_line}"
         f"\n{tagline_line}"
         f"{overview}"
         f"{user_rating_line}"
@@ -783,12 +896,24 @@ def format_person_caption(person: dict[str, Any]) -> str:
     cast = movie_credits.get("cast", [])
     known_titles = ", ".join(m.get("title", "") for m in cast[:5] if m.get("title"))
 
+    # External links
+    ext = person.get("external_ids", {})
+    links = []
+    imdb = ext.get("imdb_id")
+    if imdb:
+        links.append(f'<a href="https://www.imdb.com/name/{imdb}">🎬 IMDb</a>')
+    tmdb_id = person.get("id")
+    if tmdb_id:
+        links.append(f'<a href="https://www.themoviedb.org/person/{tmdb_id}">📊 TMDb</a>')
+    links_line = " | ".join(links) + "\n" if links else ""
+
     return (
         f"🎭 <b>{name}</b>\n"
         f"🎬 <b>حرفه:</b> {known_for}\n"
         f"🎂 <b>تولد:</b> {birthday}\n"
         f"📍 <b>محل تولد:</b> {place}\n"
-        f"\n📝 <b>بیوگرافی:</b>\n{bio}\n"
+        f"{links_line}\n"
+        f"📝 <b>بیوگرافی:</b>\n{bio}\n"
         f"\n🎞 <b>آثار شناخته‌شده:</b> {known_titles or 'N/A'}"
     )
 
@@ -803,9 +928,30 @@ def format_review(review: dict[str, Any]) -> str:
     return f"📝 <b>نقد {author}</b> {rating_str}\n\n{content}"
 
 
+def format_season_caption(season: dict[str, Any], tv_title: str) -> str:
+    name = season.get("name", "Season")
+    overview = season.get("overview") or "No overview available."
+    if len(overview) > 400:
+        overview = overview[:397] + "..."
+    episodes = season.get("episodes", [])
+    episode_count = len(episodes)
+    air_date = season.get("air_date") or "----"
+    return (
+        f"📺 <b>{tv_title}</b> — {name}\n"
+        f"📅 <b>تاریخ پخش:</b> {air_date}\n"
+        f"📊 <b>تعداد قسمت:</b> {episode_count}\n\n"
+        f"{overview}"
+    )
+
+
 def poster_url(item: dict[str, Any]) -> Optional[str]:
     path = item.get("poster_path") or item.get("profile_path")
     return f"{TMDB_IMAGE_BASE}{path}" if path else None
+
+
+def backdrop_url(item: dict[str, Any]) -> Optional[str]:
+    path = item.get("backdrop_path")
+    return f"{TMDB_BACKDROP_BASE}{path}" if path else None
 
 
 def get_youtube_trailer(item: dict[str, Any]) -> Optional[str]:
@@ -874,6 +1020,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📜 History", callback_data="menu:history"),
             InlineKeyboardButton("⚙️ Settings", callback_data="menu:settings"),
         ],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="menu:stats"),
+            InlineKeyboardButton("📤 Export", callback_data="menu:export"),
+        ],
         [InlineKeyboardButton("❓ Help", callback_data="menu:help")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -923,14 +1073,12 @@ def movie_actions_keyboard(
 ) -> InlineKeyboardMarkup:
     fav_label = "💔 Remove Favorite" if is_favorite else "❤️ Add Favorite"
     wl_label = "➖ Remove Watchlist" if is_watchlist else "📋 Add Watchlist"
+    wl_data = f"unwl:{movie_id}" if is_watchlist else f"wl:{movie_id}"
     rate_label = f"⭐ Rate ({user_rating}/10)" if user_rating else "⭐ Rate"
 
-    fav_callback = f"unfav:{movie_id}" if is_favorite else f"fav:{movie_id}"
-    wl_callback = f"unwl:{movie_id}" if is_watchlist else f"wl:{movie_id}"
-
     top_row = [
-        InlineKeyboardButton(fav_label, callback_data=fav_callback),
-        InlineKeyboardButton(wl_label, callback_data=wl_callback),
+        InlineKeyboardButton(fav_label, callback_data=f"fav:{movie_id}"),
+        InlineKeyboardButton(wl_label, callback_data=wl_data),
     ]
     second_row = [
         InlineKeyboardButton(rate_label, callback_data=f"ratemenu:{movie_id}"),
@@ -947,7 +1095,21 @@ def movie_actions_keyboard(
         ],
         [
             InlineKeyboardButton("📝 Reviews", callback_data=f"reviews:{movie_id}"),
+            InlineKeyboardButton("📤 Share", switch_inline_query=f"{movie_id}"),
         ],
+        [InlineKeyboardButton(refresh_label, callback_data=refresh_callback)],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def tv_actions_keyboard(
+    tv_id: int,
+    refresh_callback: str = "menu:tv",
+    refresh_label: str = "🔄 سریال دیگر",
+) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("📂 فصل‌ها", callback_data=f"seasons:{tv_id}")],
         [InlineKeyboardButton(refresh_label, callback_data=refresh_callback)],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
     ]
@@ -986,12 +1148,30 @@ def list_pagination_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
-def search_results_keyboard(results: list[dict[str, Any]], prefix: str = "view") -> InlineKeyboardMarkup:
+def search_results_keyboard(
+    results: list[dict[str, Any]],
+    prefix: str = "view",
+    page: int = 1,
+    total_pages: int = 1,
+    query: str = "",
+) -> InlineKeyboardMarkup:
     buttons = []
     for i, item in enumerate(results[:6], 1):
         title = item.get("title") or item.get("name") or "Untitled"
         year = (item.get("release_date") or item.get("first_air_date") or "----")[:4]
         buttons.append([InlineKeyboardButton(f"{i}. {title} ({year})", callback_data=f"{prefix}:{item['id']}")])
+
+    # Pagination for search
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"searchpage:{query}:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"searchpage:{query}:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
     buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1003,6 +1183,18 @@ def person_results_keyboard(people: list[dict[str, Any]]) -> InlineKeyboardMarku
         dept = person.get("known_for_department", "")
         label = f"{i}. {name}" + (f" ({dept})" if dept else "")
         buttons.append([InlineKeyboardButton(label, callback_data=f"person:{person['id']}")])
+    buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def seasons_keyboard(tv_id: int, seasons: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    buttons = []
+    for season in seasons:
+        num = season.get("season_number")
+        name = season.get("name", f"Season {num}")
+        if num is not None:
+            buttons.append([InlineKeyboardButton(name, callback_data=f"season:{tv_id}:{num}")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data=f"viewtv:{tv_id}")])
     buttons.append([InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(buttons)
 
@@ -1051,7 +1243,7 @@ HELP_TEXT = (
     "⭐ <b>Top Rated</b> — all-time highest rated\n"
     "🆕 <b>Now Playing</b> — currently in theaters\n"
     "📅 <b>Upcoming</b> — coming soon\n"
-    "📺 <b>TV Shows</b> — popular series\n"
+    "📺 <b>TV Shows</b> — popular series + airing today\n"
     "🎌 <b>Anime</b> — Japanese animation\n"
     "🎭 <b>Genres</b> — browse by genre\n"
     "🎬 <b>Collections</b> — Marvel, Pixar, Ghibli, Nolan\n"
@@ -1061,6 +1253,8 @@ HELP_TEXT = (
     "⭐ <b>Rate</b> — rate any movie 1–10\n"
     "📜 <b>History</b> — your recent searches\n"
     "⚙️ <b>Settings</b> — daily recommendations toggle\n"
+    "📊 <b>My Stats</b> — your activity summary\n"
+    "📤 <b>Export</b> — download favorites/watchlist as CSV\n"
     "🧠 <b>AI Recommend</b> — smart suggestions via Gemini\n\n"
     "You can also just type any movie title to search for it directly."
 )
@@ -1140,6 +1334,54 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    telegram_id = update.effective_user.id
+    fav_count = db.count_favorites(telegram_id)
+    wl_count = db.count_watchlist(telegram_id)
+    rating_count = db.get_user_rating_count(telegram_id)
+    avg_rating = db.get_user_avg_rating(telegram_id)
+    history = db.get_search_history(telegram_id, limit=1)
+
+    avg_str = f"{avg_rating:.1f}/10" if avg_rating else "N/A"
+    last_search = history[0]["query"] if history else "N/A"
+
+    text = (
+        f"📊 <b>Your Stats</b>\n\n"
+        f"❤️ <b>Favorites:</b> {fav_count}\n"
+        f"📋 <b>Watchlist:</b> {wl_count}\n"
+        f"⭐ <b>Ratings given:</b> {rating_count}\n"
+        f"📈 <b>Average rating:</b> {avg_str}\n"
+        f"🔍 <b>Last search:</b> {last_search}\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    telegram_id = update.effective_user.id
+
+    favorites = db.list_favorites(telegram_id, limit=1000)
+    watchlist = db.list_watchlist(telegram_id, limit=1000)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Type", "Movie ID", "Title"])
+    for row in favorites:
+        writer.writerow(["favorite", row["movie_id"], row["title"]])
+    for row in watchlist:
+        writer.writerow(["watchlist", row["movie_id"], row["title"]])
+
+    data = output.getvalue().encode("utf-8")
+    await update.message.reply_document(
+        document=data,
+        filename="moviebot_export.csv",
+        caption="📤 <b>Your exported data</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
 # --- Shared send helpers ---
 
 async def _send_movie(
@@ -1154,8 +1396,14 @@ async def _send_movie(
         log.error("Failed to fetch movie details for id=%s: %s", movie.get("id"), exc)
         details = movie
 
+    # Fetch providers
+    try:
+        providers = tmdb.get_movie_providers(movie["id"])
+    except TMDbError:
+        providers = None
+
     user_rating = db.get_rating(telegram_id, details["id"])
-    caption = format_movie_caption(details, user_rating=user_rating)
+    caption = format_movie_caption(details, user_rating=user_rating, providers=providers)
     trailer_url = get_youtube_trailer(details)
     keyboard = movie_actions_keyboard(
         details["id"],
@@ -1165,9 +1413,17 @@ async def _send_movie(
         trailer_url=trailer_url,
     )
     image = poster_url(details)
+    bd = backdrop_url(details)
 
     chat = update_or_query.effective_chat if hasattr(update_or_query, "effective_chat") else None
     target_chat_id = chat.id if chat else update_or_query.message.chat_id
+
+    # Send backdrop first if available, then poster with caption
+    if bd and image:
+        try:
+            await context.bot.send_photo(chat_id=target_chat_id, photo=bd)
+        except Exception:
+            pass
 
     if image:
         await context.bot.send_photo(
@@ -1203,11 +1459,18 @@ async def _send_tv_or_anime(
         details = item
 
     caption = format_movie_caption(details, media_type=media_type)
-    keyboard = simple_actions_keyboard(refresh_action, refresh_label)
+    keyboard = tv_actions_keyboard(details["id"], refresh_callback=f"menu:{refresh_action}", refresh_label=refresh_label)
     image = poster_url(details)
+    bd = backdrop_url(details)
 
     chat = update_or_query.effective_chat if hasattr(update_or_query, "effective_chat") else None
     target_chat_id = chat.id if chat else update_or_query.message.chat_id
+
+    if bd and image:
+        try:
+            await context.bot.send_photo(chat_id=target_chat_id, photo=bd)
+        except Exception:
+            pass
 
     if image:
         await context.bot.send_photo(
@@ -1317,12 +1580,12 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text("🎬 یک مجموعه انتخاب کن:", reply_markup=collections_keyboard())
 
         elif action == "trending":
-            movies = tmdb.get_trending()[:8]
+            movies = tmdb.get_trending("movie", "week")[:8]
             if not movies:
                 await query.message.reply_text("😕 No trending movies found right now.")
                 return
             await query.message.reply_text(
-                "🔥 <b>Trending this week:</b>",
+                "🔥 <b>Trending Movies this week:</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=search_results_keyboard(movies, prefix="view"),
             )
@@ -1397,6 +1660,43 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text(
                 "🔍 نام بازیگر یا کارگردان را وارد کنید:",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]]),
+            )
+
+        elif action == "stats":
+            fav_count = db.count_favorites(telegram_id)
+            wl_count = db.count_watchlist(telegram_id)
+            rating_count = db.get_user_rating_count(telegram_id)
+            avg_rating = db.get_user_avg_rating(telegram_id)
+            history = db.get_search_history(telegram_id, limit=1)
+            avg_str = f"{avg_rating:.1f}/10" if avg_rating else "N/A"
+            last_search = history[0]["query"] if history else "N/A"
+            text = (
+                f"📊 <b>Your Stats</b>\n\n"
+                f"❤️ <b>Favorites:</b> {fav_count}\n"
+                f"📋 <b>Watchlist:</b> {wl_count}\n"
+                f"⭐ <b>Ratings given:</b> {rating_count}\n"
+                f"📈 <b>Average rating:</b> {avg_str}\n"
+                f"🔍 <b>Last search:</b> {last_search}\n"
+            )
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+
+        elif action == "export":
+            favorites = db.list_favorites(telegram_id, limit=1000)
+            watchlist = db.list_watchlist(telegram_id, limit=1000)
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["Type", "Movie ID", "Title"])
+            for row in favorites:
+                writer.writerow(["favorite", row["movie_id"], row["title"]])
+            for row in watchlist:
+                writer.writerow(["watchlist", row["movie_id"], row["title"]])
+            data = output.getvalue().encode("utf-8")
+            await query.message.reply_document(
+                document=data,
+                filename="moviebot_export.csv",
+                caption="📤 <b>Your exported data</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_menu_keyboard(),
             )
 
     except TMDbError as exc:
@@ -1518,6 +1818,7 @@ async def on_similar_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     movie_id = int(query.data.split(":", 1)[1])
     tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
 
     try:
         similar = tmdb.get_similar_movies(movie_id)
@@ -1542,6 +1843,7 @@ async def on_recommendation_button(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     movie_id = int(query.data.split(":", 1)[1])
     tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
 
     try:
         recs = tmdb.get_movie_recommendations(movie_id)
@@ -1587,7 +1889,7 @@ async def on_reviews_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
-# --- Genre / Collection / View / Person / Page ---
+# --- Genre / Collection / View / Person / Page / Seasons ---
 
 async def on_genre_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1651,6 +1953,22 @@ async def on_view_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_movie(query, context, movie, telegram_id)
 
 
+async def on_view_tv_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    tv_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        show = tmdb.get_tv_details(tv_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch TV details for id=%s: %s", tv_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    await _send_tv_or_anime(query, context, show, "tv", refresh_action="tv", refresh_label="🔄 سریال دیگر")
+
+
 async def on_person_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1677,10 +1995,68 @@ async def on_page_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _show_paginated_list(query, context, query.from_user.id)
 
 
-async def on_noop_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # The page-indicator button in list_pagination_keyboard isn't meant to
-    # do anything — just clear the loading spinner Telegram shows on tap.
-    await update.callback_query.answer()
+async def on_seasons_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    tv_id = int(query.data.split(":", 1)[1])
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        show = tmdb.get_tv_details(tv_id)
+    except TMDbError as exc:
+        log.error("Failed to fetch TV seasons for id=%s: %s", tv_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    seasons = show.get("seasons", [])
+    if not seasons:
+        await query.message.reply_text("😕 فصلی پیدا نشد.")
+        return
+
+    await query.message.reply_text(
+        "📂 <b>فصل‌ها:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=seasons_keyboard(tv_id, seasons),
+    )
+
+
+async def on_season_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, tv_id_str, season_num_str = query.data.split(":")
+    tv_id = int(tv_id_str)
+    season_num = int(season_num_str)
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+
+    try:
+        show = tmdb.get_tv_details(tv_id)
+        season = tmdb.get_tv_season(tv_id, season_num)
+    except TMDbError as exc:
+        log.error("Failed to fetch season %s for tv=%s: %s", season_num, tv_id, exc)
+        await query.message.reply_text("⚠️ سرویس موقتاً در دسترس نیست.")
+        return
+
+    caption = format_season_caption(season, show.get("name", "TV Show"))
+    image = poster_url(season)
+
+    chat = query.effective_chat
+    target_chat_id = chat.id if chat else query.message.chat_id
+
+    if image:
+        await context.bot.send_photo(
+            chat_id=target_chat_id,
+            photo=image,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
 
 
 async def on_settings_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1774,18 +2150,19 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"🧠 <b>پیشنهاد هوشمند:</b> {suggested_title}", parse_mode=ParseMode.HTML
         )
-        await _send_movie(update, context, results[0], telegram_id)
+        await _send_movie(update, context, results["results"][0], telegram_id)
         return
 
     # Handle person search
     if context.user_data.get("awaiting_person_search"):
         context.user_data["awaiting_person_search"] = False
         try:
-            people = tmdb.search_person(query_text)
+            data = tmdb.search_person(query_text)
         except TMDbError as exc:
             log.error("Person search failed for '%s': %s", query_text, exc)
             await update.message.reply_text("⚠️ Search is temporarily unavailable.")
             return
+        people = data.get("results", [])
         if not people:
             await update.message.reply_text(
                 f"😕 هنرمندی با نام «{query_text}» پیدا نشد.",
@@ -1803,11 +2180,14 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db.add_search_history(telegram_id, query_text)
 
     try:
-        results = tmdb.search_movies(query_text)
+        data = tmdb.search_movies(query_text)
     except TMDbError as exc:
         log.error("TMDb search failed for query='%s': %s", query_text, exc)
         await update.message.reply_text("⚠️ Search is temporarily unavailable. Please try again shortly.")
         return
+
+    results = data.get("results", [])
+    total_pages = data.get("total_pages", 1)
 
     if not results:
         await update.message.reply_text(
@@ -1816,14 +2196,47 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    # Store search state for pagination
+    context.user_data["last_search_query"] = query_text
+    context.user_data["last_search_page"] = 1
+
     if len(results) == 1:
         await _send_movie(update, context, results[0], telegram_id)
     else:
         await update.message.reply_text(
             f"🔍 <b>Results for \"{query_text}\":</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=search_results_keyboard(results[:6], prefix="view"),
+            reply_markup=search_results_keyboard(results[:6], prefix="view", page=1, total_pages=min(total_pages, 10), query=query_text),
         )
+
+
+async def on_search_page_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, query_text, page_str = query.data.split(":", 2)
+    page = int(page_str)
+    tmdb: TMDbClient = context.bot_data["tmdb"]
+    telegram_id = query.from_user.id
+
+    try:
+        data = tmdb.search_movies(query_text, page=page)
+    except TMDbError as exc:
+        log.error("TMDb search page failed: %s", exc)
+        await query.message.reply_text("⚠️ Search is temporarily unavailable.")
+        return
+
+    results = data.get("results", [])
+    total_pages = data.get("total_pages", 1)
+
+    if not results:
+        await query.message.reply_text("😕 No more results.")
+        return
+
+    await query.message.reply_text(
+        f"🔍 <b>Results for \"{query_text}\" (page {page}):</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=search_results_keyboard(results[:6], prefix="view", page=page, total_pages=min(total_pages, 10), query=query_text),
+    )
 
 
 # --- Inline query handler ---
@@ -1835,7 +2248,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     tmdb: TMDbClient = context.bot_data["tmdb"]
     try:
-        results = tmdb.search_movies(query)[:10]
+        data = tmdb.search_movies(query)
+        results = data.get("results", [])[:10]
     except TMDbError:
         return
 
@@ -1948,6 +2362,8 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("broadcast", cmd_broadcast))
     application.add_handler(CommandHandler("settings", cmd_settings))
     application.add_handler(CommandHandler("history", cmd_history))
+    application.add_handler(CommandHandler("mystats", cmd_mystats))
+    application.add_handler(CommandHandler("export", cmd_export))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(on_menu_button, pattern=r"^menu:"))
@@ -1961,9 +2377,12 @@ def build_application(config: Config) -> Application:
     application.add_handler(CallbackQueryHandler(on_genre_button, pattern=r"^genre:"))
     application.add_handler(CallbackQueryHandler(on_collection_button, pattern=r"^collection:"))
     application.add_handler(CallbackQueryHandler(on_view_button, pattern=r"^view:"))
+    application.add_handler(CallbackQueryHandler(on_view_tv_button, pattern=r"^viewtv:"))
     application.add_handler(CallbackQueryHandler(on_person_button, pattern=r"^person:"))
     application.add_handler(CallbackQueryHandler(on_page_button, pattern=r"^page:"))
-    application.add_handler(CallbackQueryHandler(on_noop_button, pattern=r"^noop$"))
+    application.add_handler(CallbackQueryHandler(on_search_page_button, pattern=r"^searchpage:"))
+    application.add_handler(CallbackQueryHandler(on_seasons_button, pattern=r"^seasons:"))
+    application.add_handler(CallbackQueryHandler(on_season_button, pattern=r"^season:"))
     application.add_handler(CallbackQueryHandler(on_settings_toggle, pattern=r"^(toggle|clear):"))
 
     # Inline
@@ -1975,8 +2394,7 @@ def build_application(config: Config) -> Application:
     # Errors
     application.add_error_handler(on_error)
 
-    # Jobs (only if the job-queue extra / APScheduler is installed; otherwise
-    # this is silently skipped instead of crashing at startup)
+    # Jobs
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(
@@ -1984,11 +2402,6 @@ def build_application(config: Config) -> Application:
             interval=86400,
             first=3600,
             name="daily_recommendation",
-        )
-    else:
-        log.warning(
-            "JobQueue not available (install python-telegram-bot[job-queue] "
-            "to enable it) — daily recommendations are disabled."
         )
 
     return application
