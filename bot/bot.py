@@ -28,7 +28,9 @@ SETUP
 
 from __future__ import annotations
 
+import asyncio
 import csv
+import html
 import io
 import logging
 import os
@@ -245,10 +247,20 @@ class Database:
                     telegram_id          INTEGER PRIMARY KEY,
                     language             TEXT DEFAULT 'fa',
                     daily_recommendation INTEGER DEFAULT 0,
+                    adult_filter         INTEGER DEFAULT 1,
                     FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
                 )
                 """
             )
+            # user_settings already exists on the live deployment without
+            # this column — CREATE TABLE IF NOT EXISTS above won't add it
+            # to an existing table, so migrate it in explicitly.
+            try:
+                conn.execute(
+                    "ALTER TABLE user_settings ADD COLUMN adult_filter INTEGER DEFAULT 1"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def upsert_user(self, telegram_id: int, username: Optional[str]) -> None:
         with self._connect() as conn:
@@ -419,13 +431,13 @@ class Database:
     def get_user_settings(self, telegram_id: int) -> sqlite3.Row:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT language, daily_recommendation FROM user_settings WHERE telegram_id = ?",
+                "SELECT language, daily_recommendation, adult_filter FROM user_settings WHERE telegram_id = ?",
                 (telegram_id,),
             ).fetchone()
             return row
 
     def update_user_settings(self, telegram_id: int, **kwargs) -> None:
-        allowed = {"language", "daily_recommendation"}
+        allowed = {"language", "daily_recommendation", "adult_filter"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
@@ -565,8 +577,11 @@ class TMDbClient:
         results = self._get("/movie/popular", params={"page": page}).get("results", [])
         return random.choice(results) if results else None
 
-    def search_movies(self, query: str, page: int = 1) -> dict[str, Any]:
-        return self._get("/search/movie", params={"query": query, "page": page})
+    def search_movies(self, query: str, page: int = 1, include_adult: bool = False) -> dict[str, Any]:
+        return self._get(
+            "/search/movie",
+            params={"query": query, "page": page, "include_adult": str(include_adult).lower()},
+        )
 
     def get_movie_details(self, movie_id: int) -> dict[str, Any]:
         details = self._get(f"/movie/{movie_id}", params={"append_to_response": "videos,credits,keywords,release_dates,external_ids"})
@@ -711,6 +726,17 @@ class GeminiClient:
 # 7. FORMATTING HELPERS
 # =========================================================================
 
+def _e(text: Any) -> str:
+    """Escapes a value for safe interpolation into an HTML-parsed Telegram
+    message. Movie titles/overviews routinely contain '&', '<', '>' (e.g.
+    "Tom & Jerry", "Star Wars: Episode I <1999>" style text) — without this,
+    Telegram rejects the whole message with a parse error and the user gets
+    silence instead of a movie card."""
+    if text is None:
+        return ""
+    return html.escape(str(text), quote=False)
+
+
 def _extract_director(crew: list[dict]) -> Optional[str]:
     for person in crew:
         if person.get("job") == "Director":
@@ -734,7 +760,7 @@ def _format_providers(providers: dict[str, Any], region: str = "US") -> str:
     for provider_type in ("flatrate", "rent", "buy"):
         items = region_data.get(provider_type, [])
         if items:
-            names = ", ".join(p.get("provider_name", "") for p in items[:5])
+            names = ", ".join(_e(p.get("provider_name", "")) for p in items[:5])
             emoji = {"flatrate": "📺", "rent": "🎫", "buy": "💳"}.get(provider_type, "▶️")
             label = {"flatrate": "Stream", "rent": "Rent", "buy": "Buy"}.get(provider_type, provider_type)
             lines.append(f"{emoji} <b>{label}:</b> {names}")
@@ -748,14 +774,14 @@ def _format_certification(release_dates: list[dict], region: str = "US") -> str:
             for c in certs:
                 cert = c.get("certification", "")
                 if cert:
-                    return f"🔞 <b>Rated:</b> {cert}\n"
+                    return f"🔞 <b>Rated:</b> {_e(cert)}\n"
     return ""
 
 
 def _format_keywords(keywords: list[dict]) -> str:
     if not keywords:
         return ""
-    names = ", ".join(k.get("name", "") for k in keywords[:8])
+    names = ", ".join(_e(k.get("name", "")) for k in keywords[:8])
     return f"🏷 <b>Keywords:</b> {names}\n"
 
 
@@ -777,32 +803,32 @@ def format_movie_caption(
     providers: Optional[dict[str, Any]] = None,
 ) -> str:
     if media_type == "tv":
-        title = item.get("name") or item.get("original_name") or "بدون عنوان"
+        title = _e(item.get("name") or item.get("original_name") or "بدون عنوان")
         date_value = item.get("first_air_date") or "----"
         icon = "📺"
     elif media_type == "anime":
-        title = item.get("title") or item.get("original_title") or "بدون عنوان"
+        title = _e(item.get("title") or item.get("original_title") or "بدون عنوان")
         date_value = item.get("release_date") or "----"
         icon = "🎌"
     else:
-        title = item.get("title") or item.get("original_title") or "بدون عنوان"
+        title = _e(item.get("title") or item.get("original_title") or "بدون عنوان")
         date_value = item.get("release_date") or "----"
         icon = "🎬"
 
     year = date_value[:4]
     rating = item.get("vote_average", 0)
     vote_count = item.get("vote_count", 0)
-    overview = item.get("overview") or "توضیحاتی برای این عنوان موجود نیست."
+    overview = _e(item.get("overview") or "توضیحاتی برای این عنوان موجود نیست.")
     if len(overview) > 500:
         overview = overview[:497] + "..."
 
-    tagline = item.get("tagline", "")
+    tagline = _e(item.get("tagline", ""))
     tagline_line = f"<i>{tagline}</i>\n\n" if tagline else ""
 
     genres = item.get("genres")
     genre_line = ""
     if genres:
-        names = ", ".join(g["name"] for g in genres)
+        names = ", ".join(_e(g["name"]) for g in genres)
         genre_line = f"🎭 <b>ژانر:</b> {names}\n"
 
     runtime_line = ""
@@ -814,7 +840,7 @@ def format_movie_caption(
         episodes = item.get("number_of_episodes")
         if seasons:
             runtime_line += f"📊 <b>فصل:</b> {seasons} | <b>قسمت:</b> {episodes or 'N/A'}\n"
-        status = item.get("status", "")
+        status = _e(item.get("status", ""))
         if status:
             runtime_line += f"📡 <b>وضعیت:</b> {status}\n"
     else:
@@ -832,9 +858,9 @@ def format_movie_caption(
     top_cast = _extract_top_cast(credits.get("cast", []))
     crew_line = ""
     if director:
-        crew_line += f"🎬 <b>کارگردان:</b> {director}\n"
+        crew_line += f"🎬 <b>کارگردان:</b> {_e(director)}\n"
     if top_cast:
-        crew_line += f"🎭 <b>بازیگران:</b> {top_cast}\n"
+        crew_line += f"🎭 <b>بازیگران:</b> {_e(top_cast)}\n"
 
     budget = item.get("budget")
     revenue = item.get("revenue")
@@ -847,7 +873,7 @@ def format_movie_caption(
     companies = item.get("production_companies", [])
     company_line = ""
     if companies:
-        company_names = ", ".join(c["name"] for c in companies[:3])
+        company_names = ", ".join(_e(c["name"]) for c in companies[:3])
         company_line = f"🏢 <b>استودیو:</b> {company_names}\n"
 
     # Keywords & Certification
@@ -892,17 +918,17 @@ def format_movie_caption(
 
 
 def format_person_caption(person: dict[str, Any]) -> str:
-    name = person.get("name", "Unknown")
-    known_for = person.get("known_for_department", "")
-    birthday = person.get("birthday") or "N/A"
-    place = person.get("place_of_birth") or "N/A"
-    bio = person.get("biography") or "Biography not available."
+    name = _e(person.get("name", "Unknown"))
+    known_for = _e(person.get("known_for_department", ""))
+    birthday = _e(person.get("birthday") or "N/A")
+    place = _e(person.get("place_of_birth") or "N/A")
+    bio = _e(person.get("biography") or "Biography not available.")
     if len(bio) > 600:
         bio = bio[:597] + "..."
 
     movie_credits = person.get("movie_credits", {})
     cast = movie_credits.get("cast", [])
-    known_titles = ", ".join(m.get("title", "") for m in cast[:5] if m.get("title"))
+    known_titles = ", ".join(_e(m.get("title", "")) for m in cast[:5] if m.get("title"))
 
     # External links
     ext = person.get("external_ids", {})
@@ -927,9 +953,9 @@ def format_person_caption(person: dict[str, Any]) -> str:
 
 
 def format_review(review: dict[str, Any]) -> str:
-    author = review.get("author", "Anonymous")
+    author = _e(review.get("author", "Anonymous"))
     rating = review.get("author_details", {}).get("rating")
-    content = review.get("content", "")
+    content = _e(review.get("content", ""))
     if len(content) > 800:
         content = content[:797] + "..."
     rating_str = f"⭐ {rating}/10" if rating else ""
@@ -937,15 +963,15 @@ def format_review(review: dict[str, Any]) -> str:
 
 
 def format_season_caption(season: dict[str, Any], tv_title: str) -> str:
-    name = season.get("name", "Season")
-    overview = season.get("overview") or "No overview available."
+    name = _e(season.get("name", "Season"))
+    overview = _e(season.get("overview") or "No overview available.")
     if len(overview) > 400:
         overview = overview[:397] + "..."
     episodes = season.get("episodes", [])
     episode_count = len(episodes)
     air_date = season.get("air_date") or "----"
     return (
-        f"📺 <b>{tv_title}</b> — {name}\n"
+        f"📺 <b>{_e(tv_title)}</b> — {name}\n"
         f"📅 <b>تاریخ پخش:</b> {air_date}\n"
         f"📊 <b>تعداد قسمت:</b> {episode_count}\n\n"
         f"{overview}"
@@ -1209,10 +1235,12 @@ def seasons_keyboard(tv_id: int, seasons: list[dict[str, Any]]) -> InlineKeyboar
     return InlineKeyboardMarkup(buttons)
 
 
-def settings_keyboard(lang: str, daily: int) -> InlineKeyboardMarkup:
+def settings_keyboard(lang: str, daily: int, adult_filter: int = 1) -> InlineKeyboardMarkup:
     daily_label = "🔔 Daily: ON" if daily else "🔕 Daily: OFF"
+    adult_label = "🔞 محتوای بزرگسال: مسدود" if adult_filter else "🔞 محتوای بزرگسال: آزاد"
     buttons = [
         [InlineKeyboardButton(daily_label, callback_data="toggle:daily")],
+        [InlineKeyboardButton(adult_label, callback_data="toggle:adult")],
         [InlineKeyboardButton("🗑 Clear History", callback_data="clear:history")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
     ]
@@ -1314,7 +1342,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "⚙️ <b>Settings</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+        reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"], settings["adult_filter"]),
     )
 
 
@@ -1327,7 +1355,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "📜 No search history yet.", reply_markup=back_to_menu_keyboard()
         )
         return
-    lines = [f"• {row['query']} — <i>{row['searched_at']}</i>" for row in history]
+    lines = [f"• {_e(row['query'])} — <i>{row['searched_at']}</i>" for row in history]
     await update.message.reply_text(
         "📜 <b>Recent Searches:</b>\n\n" + "\n".join(lines),
         parse_mode=ParseMode.HTML,
@@ -1628,7 +1656,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "📜 No search history yet.", reply_markup=back_to_menu_keyboard()
                 )
                 return
-            lines = [f"• {row['query']} — <i>{row['searched_at']}</i>" for row in history]
+            lines = [f"• {_e(row['query'])} — <i>{row['searched_at']}</i>" for row in history]
             await query.message.reply_text(
                 "📜 <b>Recent Searches:</b>\n\n" + "\n".join(lines),
                 parse_mode=ParseMode.HTML,
@@ -1640,7 +1668,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text(
                 "⚙️ <b>Settings</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+                reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"], settings["adult_filter"]),
             )
 
         elif action == "person":
@@ -2066,7 +2094,17 @@ async def on_settings_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text(
             "⚙️ <b>Settings updated.</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"]),
+            reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"], settings["adult_filter"]),
+        )
+    elif action == "adult":
+        settings = db.get_user_settings(telegram_id)
+        new_val = 0 if settings["adult_filter"] else 1
+        db.update_user_settings(telegram_id, adult_filter=new_val)
+        settings = db.get_user_settings(telegram_id)
+        await query.message.reply_text(
+            "⚙️ <b>Settings updated.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(settings["language"], settings["daily_recommendation"], settings["adult_filter"]),
         )
     elif action == "history":
         db.clear_search_history(telegram_id)
@@ -2105,6 +2143,7 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as exc:
                 log.warning("Broadcast failed for user %s: %s", uid, exc)
                 failed += 1
+            await asyncio.sleep(0.05)  # stay comfortably under Telegram's rate limits
         await update.message.reply_text(
             f"📢 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}",
             reply_markup=back_to_menu_keyboard(),
@@ -2141,7 +2180,7 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         await update.message.reply_text(
-            f"🧠 <b>پیشنهاد هوشمند:</b> {suggested_title}", parse_mode=ParseMode.HTML
+            f"🧠 <b>پیشنهاد هوشمند:</b> {_e(suggested_title)}", parse_mode=ParseMode.HTML
         )
         await _send_movie(update, context, results[0], telegram_id)
         return
@@ -2171,9 +2210,11 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Regular movie search
     db.add_search_history(telegram_id, query_text)
+    user_settings = db.get_user_settings(telegram_id)
+    allow_adult = not user_settings["adult_filter"] if user_settings else False
 
     try:
-        data = tmdb.search_movies(query_text)
+        data = tmdb.search_movies(query_text, include_adult=allow_adult)
     except TMDbError as exc:
         log.error("TMDb search failed for query='%s': %s", query_text, exc)
         await update.message.reply_text("⚠️ Search is temporarily unavailable. Please try again shortly.")
@@ -2197,7 +2238,7 @@ async def on_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _send_movie(update, context, results[0], telegram_id)
     else:
         await update.message.reply_text(
-            f"🔍 <b>Results for \"{query_text}\":</b>",
+            f"🔍 <b>Results for \"{_e(query_text)}\":</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=search_results_keyboard(results[:6], prefix="view", page=1, total_pages=min(total_pages, 10)),
         )
@@ -2209,6 +2250,7 @@ async def on_search_page_button(update: Update, context: ContextTypes.DEFAULT_TY
     page = int(query.data.split(":", 1)[1])
     query_text = context.user_data.get("last_search_query")
     tmdb: TMDbClient = context.bot_data["tmdb"]
+    db: Database = context.bot_data["db"]
 
     if not query_text:
         await query.message.reply_text(
@@ -2217,8 +2259,11 @@ async def on_search_page_button(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    user_settings = db.get_user_settings(query.from_user.id)
+    allow_adult = not user_settings["adult_filter"] if user_settings else False
+
     try:
-        data = tmdb.search_movies(query_text, page=page)
+        data = tmdb.search_movies(query_text, page=page, include_adult=allow_adult)
     except TMDbError as exc:
         log.error("TMDb search page failed: %s", exc)
         await query.message.reply_text("⚠️ Search is temporarily unavailable.")
@@ -2232,7 +2277,7 @@ async def on_search_page_button(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.message.reply_text(
-        f"🔍 <b>Results for \"{query_text}\" (page {page}):</b>",
+        f"🔍 <b>Results for \"{_e(query_text)}\" (page {page}):</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=search_results_keyboard(results[:6], prefix="view", page=page, total_pages=min(total_pages, 10)),
     )
@@ -2268,7 +2313,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     id=str(movie["id"]),
                     title=f"{title} ({year})",
                     input_message_content=InputTextMessageContent(
-                        message_text=f"🎬 <b>{title}</b> ({year})\n⭐ {movie.get('vote_average', 0):.1f}/10\n\n{overview}",
+                        message_text=f"🎬 <b>{_e(title)}</b> ({year})\n⭐ {movie.get('vote_average', 0):.1f}/10\n\n{_e(overview)}",
                         parse_mode=ParseMode.HTML,
                     ),
                     description=overview,
@@ -2296,7 +2341,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 id=str(movie["id"]),
                 title=f"{title} ({year})",
                 input_message_content=InputTextMessageContent(
-                    message_text=f"🎬 <b>{title}</b> ({year})\n⭐ {movie.get('vote_average', 0):.1f}/10\n\n{overview}",
+                    message_text=f"🎬 <b>{_e(title)}</b> ({year})\n⭐ {movie.get('vote_average', 0):.1f}/10\n\n{_e(overview)}",
                     parse_mode=ParseMode.HTML,
                 ),
                 description=overview,
