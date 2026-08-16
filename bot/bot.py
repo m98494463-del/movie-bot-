@@ -430,6 +430,18 @@ class Database:
     # --- User Settings ---
     def get_user_settings(self, telegram_id: int) -> sqlite3.Row:
         with self._connect() as conn:
+            # Guarantees a row exists even if this is reached without going
+            # through upsert_user first (e.g. /settings as someone's very
+            # first message) — previously this could return None and crash
+            # every settings screen silently. users comes first since
+            # user_settings has a FOREIGN KEY on it (enforcement is ON).
+            conn.execute(
+                "INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_settings (telegram_id) VALUES (?)",
+                (telegram_id,),
+            )
             row = conn.execute(
                 "SELECT language, daily_recommendation, adult_filter FROM user_settings WHERE telegram_id = ?",
                 (telegram_id,),
